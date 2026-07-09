@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+transformers
+accelerate
+huggingface_hub
+soundfile
+numpy
