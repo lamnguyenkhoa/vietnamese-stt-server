@@ -5,8 +5,17 @@ A FastAPI server that transcribes audio to text using [PhoWhisper-medium](https:
 ## Prerequisites
 
 - Docker (with NVIDIA Container Toolkit if you want GPU acceleration)
+- Model weights in `models/` (see below)
 
-Model weights are downloaded automatically during the image build (`docker build` runs `download_model.py`), so the resulting image is self-contained — no manual download or volume mount needed.
+### Getting the model weights
+
+Fetch the model files (config, tokenizer, and `pytorch_model.bin`, ~3GB) into `models/`:
+
+```bash
+python download_model.py
+```
+
+The build then copies `models/` into the image, so the resulting image is self-contained — no volume mount needed at runtime.
 
 ## Build the image
 
@@ -34,12 +43,6 @@ docker run -p 8000:8000 vietnamese-stt-server
 python -m venv venv
 ./venv/Scripts/activate      # Windows
 pip install -r requirements.txt
-```
-
-Fetch the model weights into `models/`:
-
-```bash
-python download_model.py
 ```
 
 Then start it with the provided script (uses local `models/` by default):

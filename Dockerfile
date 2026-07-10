@@ -17,11 +17,6 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 # Remaining deps from requirements.txt (fastapi, transformers, etc.)
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY download_model.py .
-
-# Bake model weights into the image so the container is self-contained.
-RUN python download_model.py
-
 COPY . .
 
 ENV MODEL_DIR=/app/models
