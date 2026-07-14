@@ -4,3 +4,5 @@ __pycache__
 server.log
 models
 dist/
+*.zip
+*.rar

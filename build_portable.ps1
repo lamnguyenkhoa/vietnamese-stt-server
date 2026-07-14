@@ -89,13 +89,27 @@ Copy-Item $FfmpegExe.FullName (Join-Path $BinDir "ffmpeg.exe")
 Remove-Item $FfmpegZipPath
 Remove-Item -Recurse -Force $FfmpegExtractDir
 
+$ConfigBat = @'
+@echo off
+REM Edit these values, then restart run.bat to apply them.
+set HOST=0.0.0.0
+set PORT=8000
+
+REM On a multi-GPU machine, pin to one GPU (e.g. "0" or "1") to avoid contention with
+REM other processes already loaded onto a busier GPU. Leave blank to let CUDA pick.
+set CUDA_VISIBLE_DEVICES=
+'@
+Set-Content -Path (Join-Path $OutDir "config.bat") -Value $ConfigBat -Encoding ASCII
+
 $RunBat = @'
 @echo off
 setlocal
 cd /d "%~dp0"
+call "%~dp0config.bat"
+title Vietnamese STT Server (port %PORT%)
 set MODEL_DIR=%~dp0models
 set FFMPEG_BIN=%~dp0bin\ffmpeg.exe
-"%~dp0python\python.exe" -m uvicorn main:app --host 0.0.0.0 --port 8000
+"%~dp0python\python.exe" -m uvicorn main:app --host %HOST% --port %PORT%
 '@
 Set-Content -Path (Join-Path $OutDir "run.bat") -Value $RunBat -Encoding ASCII
 

@@ -110,7 +110,24 @@ the target server does not.
 
 This produces `dist\vietnamese-stt-server-portable\`. Copy the whole folder to the
 target server and run `run.bat`. It sets `MODEL_DIR` and `FFMPEG_BIN` to point at the
-bundled copies and starts uvicorn on port 8000 — same API as the Docker deployment.
+bundled copies and starts uvicorn — same API as the Docker deployment.
+
+To change the host/port after building (e.g. on the target server, no rebuild needed),
+edit `config.bat` in the output folder:
+
+```bat
+set HOST=0.0.0.0
+set PORT=8000
+set CUDA_VISIBLE_DEVICES=
+```
+
+`CUDA_VISIBLE_DEVICES` is useful on a multi-GPU machine shared with other processes:
+set it to `0` or `1` to pin the server to a specific, less-contended GPU. If you see
+`torch.AcceleratorError: CUDA-capable device(s) is/are busy or unavailable` at startup
+on a machine with several other CUDA processes already running, check `nvidia-smi` for
+which GPU has fewer processes/contexts and pin to that one.
+
+`run.bat` sources it on every start.
 
 The build script installs the `cu128` torch build by default (matching the amd64
 Docker image). If the target server's driver has a different CUDA ceiling, edit the
