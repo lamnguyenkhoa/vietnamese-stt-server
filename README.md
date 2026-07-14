@@ -23,6 +23,34 @@ The build then copies `models/` into the image, so the resulting image is self-c
 docker build -t khoalamphilong/vietnamese-stt-server .
 ```
 
+This builds for your host architecture. amd64 gets a CUDA 12.8 PyTorch build; arm64 gets
+a CUDA 13.0 build (PyTorch's `cu128` index has no arm64 wheels, but `cu130` does).
+
+The arm64 GPU build only works if the target machine's driver supports CUDA 13.0+
+(check with `nvidia-smi` — see [docs/torch-cuda-version.md](docs/torch-cuda-version.md)
+for how to read the "CUDA Version" ceiling). If your arm64 target's driver only covers
+12.x, edit the `arm64` branch in the [Dockerfile](Dockerfile) to `pip install torch`
+(no index URL) for a CPU-only build instead.
+
+### Building for arm64 / multi-arch
+
+Requires [Docker Buildx](https://docs.docker.com/build/buildx/) (bundled with modern
+Docker Desktop; on Linux you may need `docker buildx create --use` once).
+
+Build an arm64 image while on an amd64 host (or vice versa) via emulation:
+
+```bash
+docker buildx build --platform linux/arm64 -t khoalamphilong/vietnamese-stt-server:arm64 --load .
+```
+
+Or build and push a single multi-arch manifest covering both architectures at once
+(requires pushing to a registry — `--load` doesn't support multi-platform images):
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t khoalamphilong/vietnamese-stt-server:latest --push .
+```
+
 ## Run the image
 
 GPU (requires NVIDIA Container Toolkit):

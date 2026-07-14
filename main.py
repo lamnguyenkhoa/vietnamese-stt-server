@@ -1,3 +1,4 @@
+import logging
 import os
 import subprocess
 import tempfile
@@ -22,18 +23,28 @@ SILENCE_RMS_THRESHOLD = 0.01
 def is_silent(audio: "np.ndarray") -> bool:
     return float(np.sqrt(np.mean(np.square(audio)))) < SILENCE_RMS_THRESHOLD
 
+logger = logging.getLogger("uvicorn.error")
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model_state = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if device == "cpu":
+        logger.warning(
+            "torch.cuda.is_available() is False - running on CPU. "
+            "If a GPU was expected, check the driver's CUDA ceiling (nvidia-smi) "
+            "against the torch build installed (see docs/torch-cuda-version.md)."
+        )
+
     model_state["processor"] = WhisperProcessor.from_pretrained(MODEL_DIR)
-    model_state["model"] = (
-        WhisperForConditionalGeneration.from_pretrained(MODEL_DIR)
-        .to(device)
-        .eval()
-    )
+    model = WhisperForConditionalGeneration.from_pretrained(MODEL_DIR).to(device).eval()
+    if device == "cpu":
+        # fp16 has no real hardware acceleration on CPU in PyTorch and is often
+        # slower than fp32 there (unlike on CUDA, where fp16 is a speedup).
+        model = model.float()
+    model_state["model"] = model
     yield
     model_state.clear()
 
