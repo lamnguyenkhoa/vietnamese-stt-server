@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<title>PhoWhisper Streaming Test</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  button { font-size: 16px; padding: 8px 20px; margin-right: 8px; }
+  #status { color: #666; margin: 12px 0; }
+  #transcript { border: 1px solid #ccc; border-radius: 6px; padding: 12px; min-height: 120px; white-space: pre-wrap; }
+  .partial { color: #999; }
+</style>
+</head>
+<body>
+  <h1>PhoWhisper Streaming Test</h1>
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="status">idle</div>
+  <div id="transcript"></div>
+
+<script>
+const startBtn = document.getElementById("start");
+const stopBtn = document.getElementById("stop");
+const statusEl = document.getElementById("status");
+const transcriptEl = document.getElementById("transcript");
+
+let ws, audioCtx, source, processor, stream;
+let finalText = "";
+
+function floatTo16kPCM16(float32, inputRate) {
+  // downsample to 16kHz via linear interpolation, then convert to int16
+  const ratio = inputRate / 16000;
+  const outLength = Math.floor(float32.length / ratio);
+  const out = new Int16Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const srcIdx = i * ratio;
+    const i0 = Math.floor(srcIdx);
+    const i1 = Math.min(i0 + 1, float32.length - 1);
+    const frac = srcIdx - i0;
+    const sample = float32[i0] * (1 - frac) + float32[i1] * frac;
+    const clamped = Math.max(-1, Math.min(1, sample));
+    out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+  }
+  return out;
+}
+
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  finalText = "";
+  transcriptEl.textContent = "";
+  statusEl.textContent = "requesting mic...";
+
+  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioCtx = new AudioContext();
+  source = audioCtx.createMediaStreamSource(stream);
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/transcribe`);
+  ws.onopen = () => (statusEl.textContent = "streaming...");
+  ws.onclose = () => (statusEl.textContent = "closed");
+  ws.onerror = (e) => (statusEl.textContent = "error: " + e.message);
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    finalText += (finalText ? " " : "") + msg.text;
+    transcriptEl.textContent = finalText;
+  };
+
+  processor.onaudioprocess = (e) => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const input = e.inputBuffer.getChannelData(0);
+    const pcm16 = floatTo16kPCM16(input, audioCtx.sampleRate);
+    ws.send(pcm16.buffer);
+  };
+
+  source.connect(processor);
+  processor.connect(audioCtx.destination);
+};
+
+stopBtn.onclick = () => {
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  statusEl.textContent = "stopping...";
+
+  processor && processor.disconnect();
+  source && source.disconnect();
+  stream && stream.getTracks().forEach((t) => t.stop());
+  audioCtx && audioCtx.close();
+
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send("end");
+  }
+};
+</script>
+</body>
+</html>
