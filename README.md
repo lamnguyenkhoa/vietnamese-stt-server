@@ -20,7 +20,7 @@ The build then copies `models/` into the image, so the resulting image is self-c
 ## Build the image
 
 ```bash
-docker build -t vietnamese-stt-server .
+docker build -t khoalamphilong/vietnamese-stt-server .
 ```
 
 ## Run the image

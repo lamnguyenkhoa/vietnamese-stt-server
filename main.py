@@ -9,7 +9,9 @@ import torch
 from fastapi import FastAPI, HTTPException, UploadFile
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "vinai/PhoWhisper-medium")
+from download_model import REPO_ID
+
+MODEL_DIR = os.environ.get("MODEL_DIR", REPO_ID)
 SAMPLE_RATE = 16000
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -77,12 +79,14 @@ async def transcribe(file: UploadFile):
     input_features = inputs.input_features.to(device)
 
     with torch.no_grad():
-        predicted_ids = model.generate(input_features)
+        predicted_ids = model.generate(input_features, language="vi", task="transcribe")
 
-    text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+    text = processor.batch_decode(
+        predicted_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )[0]
     return {"text": text.strip()}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "device": device}
+    return {"status": "ok", "device": device, "model": REPO_ID}
