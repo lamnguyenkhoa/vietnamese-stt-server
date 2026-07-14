@@ -1,5 +1,6 @@
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 from contextlib import asynccontextmanager
@@ -18,6 +19,14 @@ MODEL_DIR = os.environ.get("MODEL_DIR", REPO_ID)
 SAMPLE_RATE = 16000
 STREAM_CHUNK_SECONDS = 3.0
 SILENCE_RMS_THRESHOLD = 0.01
+
+# Resolve ffmpeg: explicit override, then PATH, then a copy bundled alongside the app
+# (used by the portable Windows package, which ships its own ffmpeg.exe).
+FFMPEG_BIN = (
+    os.environ.get("FFMPEG_BIN")
+    or shutil.which("ffmpeg")
+    or str(Path(__file__).parent / "bin" / "ffmpeg.exe")
+)
 
 
 def is_silent(audio: "np.ndarray") -> bool:
@@ -63,7 +72,7 @@ def load_audio(raw_bytes: bytes) -> "list[float]":
 
         result = subprocess.run(
             [
-                "ffmpeg",
+                FFMPEG_BIN,
                 "-y",
                 "-i",
                 src.name,

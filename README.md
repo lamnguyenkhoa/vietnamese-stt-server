@@ -89,6 +89,34 @@ Requires `ffmpeg` and `libsndfile` installed on the host.
 
 Then you can go to localhost:8000/docs to test it.
 
+## Portable Windows deployment (no Docker)
+
+For Windows servers where Docker isn't available/allowed, [build_portable.ps1](build_portable.ps1)
+packages the app into a self-contained folder: a standalone Python (the official
+embeddable distribution, not a venv — no dependency on any Python already installed on
+the target machine), CUDA torch and all deps, a static ffmpeg build, plus the app code
+and model weights. Nothing needs to be pre-installed on the target server.
+
+Run this from **PowerShell** (not Git Bash/WSL — the script uses PowerShell syntax):
+
+```powershell
+python download_model.py      # if you haven't already
+.\build_portable.ps1
+```
+
+The build machine needs internet access (it downloads the Python embeddable zip, pip,
+and a static ffmpeg build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds));
+the target server does not.
+
+This produces `dist\vietnamese-stt-server-portable\`. Copy the whole folder to the
+target server and run `run.bat`. It sets `MODEL_DIR` and `FFMPEG_BIN` to point at the
+bundled copies and starts uvicorn on port 8000 — same API as the Docker deployment.
+
+The build script installs the `cu128` torch build by default (matching the amd64
+Docker image). If the target server's driver has a different CUDA ceiling, edit the
+`--index-url` in `build_portable.ps1` — see
+[docs/torch-cuda-version.md](docs/torch-cuda-version.md).
+
 ## API
 
 - `POST /transcribe` — multipart file upload (`file`), returns `{"text": "..."}`
