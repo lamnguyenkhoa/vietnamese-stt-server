@@ -120,13 +120,16 @@ async def transcribe_stream(websocket: WebSocket):
                 buffer = np.concatenate([buffer, pcm16.astype(np.float32) / 32768.0])
 
                 if len(buffer) >= chunk_samples:
-                    text = transcribe_array(buffer)
+                    if is_silent(buffer):
+                        text = ""
+                    else:
+                        text = transcribe_array(buffer)
                     buffer = np.empty(0, dtype=np.float32)
                     if text:
                         await websocket.send_json({"text": text, "final": False})
 
             elif message.get("text") == "end":
-                if len(buffer) > 0:
+                if len(buffer) > 0 and not is_silent(buffer):
                     text = transcribe_array(buffer)
                     if text:
                         await websocket.send_json({"text": text, "final": True})
