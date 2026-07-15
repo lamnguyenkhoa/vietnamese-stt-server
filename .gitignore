@@ -3,6 +3,6 @@ __pycache__
 *.pyc
 server.log
 models
-dist/
+dist
 *.zip
 *.rar

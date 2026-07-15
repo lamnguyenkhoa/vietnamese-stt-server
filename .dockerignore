@@ -3,3 +3,7 @@ __pycache__
 *.pyc
 server.log
 data
+docs
+dist
+*.zip
+ststic
