@@ -3,9 +3,12 @@ Builds a self-contained, portable folder for running the STT server on a Windows
 server without Docker or a pre-installed Python/ffmpeg. Downloads the official Python
 embeddable distribution (a standalone runtime, not a venv -- no dependency on any
 Python already present on the target machine), bootstraps pip into it, installs all
-deps (including CUDA-enabled torch), downloads a static ffmpeg build and the model
-weights, and writes out the app code (embedded in this script -- no repo checkout
-needed).
+deps, downloads a static ffmpeg build and the model weights, and writes out the app
+code (embedded in this script -- no repo checkout needed).
+
+By default this installs CPU-only torch, which keeps the output folder small
+(a few hundred MB instead of several GB) -- pass -Cuda to install CUDA 12.8 torch
+instead for GPU acceleration (adds ~4GB).
 
 This script is fully self-contained: copy just this one file to the target machine
 and run it there, or run it on a dev machine and copy the resulting output folder.
@@ -13,6 +16,7 @@ and run it there, or run it on a dev machine and copy the resulting output folde
 Usage:
     .\build_portable.ps1
     .\build_portable.ps1 -OutDir C:\deploy\vietnamese-stt-server
+    .\build_portable.ps1 -Cuda
 
 Requires: internet access on the machine running this script (to fetch the embeddable
 Python, pip, ffmpeg, and the model weights from Hugging Face).
@@ -23,7 +27,11 @@ param(
     [string]$PythonVersion = "3.13.12",
     # BtbN/FFmpeg-Builds release asset, pinned to the n8.1 release build (static, GPL),
     # not the rolling nightly "master" build, so the ffmpeg version stays predictable.
-    [string]$FfmpegAssetUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip"
+    [string]$FfmpegAssetUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip",
+    # Install CUDA 12.8 torch for GPU acceleration instead of the default CPU-only
+    # build. Adds ~4GB to the output folder -- see docs/torch-cuda-version.md if the
+    # target machine's driver doesn't support CUDA 12.8.
+    [switch]$Cuda
 )
 
 $ErrorActionPreference = "Stop"
@@ -536,8 +544,13 @@ Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile $GetPipPa
 & $PyExe $GetPipPath --no-warn-script-location
 Remove-Item $GetPipPath
 
-Write-Host "Installing torch (CUDA 12.8 build)..."
-& $PyExe -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
+if ($Cuda) {
+    Write-Host "Installing torch (CUDA 12.8 build)..."
+    & $PyExe -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
+} else {
+    Write-Host "Installing torch (CPU-only build)..."
+    & $PyExe -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+}
 
 Write-Host "Installing remaining requirements..."
 & $PyExe -m pip install --no-cache-dir -r $RequirementsPath
@@ -549,6 +562,29 @@ try {
 } finally {
     Pop-Location
 }
+
+# Convert to fp16 safetensors to roughly halve the weights on disk (923MB -> ~460MB).
+# Safe for CPU too: main.py upcasts back to fp32 before running inference on CPU, so
+# this only affects disk size, not runtime precision or speed.
+Write-Host "Converting model weights to fp16 (halves size on disk)..."
+$ConvertFp16Py = @'
+import torch
+from transformers import WhisperForConditionalGeneration
+
+model = WhisperForConditionalGeneration.from_pretrained("models", torch_dtype=torch.float32)
+model.half()
+model.save_pretrained("models")
+'@
+$ConvertFp16Path = Join-Path $OutDir "_convert_fp16.py"
+Set-Content -Path $ConvertFp16Path -Value $ConvertFp16Py -Encoding UTF8
+Push-Location $OutDir
+try {
+    & $PyExe _convert_fp16.py
+} finally {
+    Pop-Location
+}
+Remove-Item $ConvertFp16Path
+Remove-Item (Join-Path $OutDir "models\pytorch_model.bin") -ErrorAction SilentlyContinue
 
 Write-Host "Downloading static ffmpeg build..."
 $BinDir = Join-Path $OutDir "bin"

@@ -94,8 +94,12 @@ Then you can go to localhost:8000/docs to test it.
 For Windows servers where Docker isn't available/allowed, [build_portable.ps1](build_portable.ps1)
 packages the app into a self-contained folder: a standalone Python (the official
 embeddable distribution, not a venv — no dependency on any Python already installed on
-the target machine), CUDA torch and all deps, a static ffmpeg build, plus the app code
+the target machine), torch and all deps, a static ffmpeg build, plus the app code
 and model weights. Nothing needs to be pre-installed on the target server.
+
+By default this installs CPU-only torch, keeping the output folder small (a few
+hundred MB) and easy to copy between machines. Pass `-Cuda` to install CUDA 12.8 torch
+instead for GPU acceleration — this adds ~4GB to the output.
 
 The script is fully self-contained — the app source (`main.py`, `download_model.py`,
 `requirements.txt`, `static/index.html`) is embedded directly in it, so it does **not**
@@ -106,6 +110,7 @@ Run this from **PowerShell** (not Git Bash/WSL — the script uses PowerShell sy
 
 ```powershell
 .\build_portable.ps1
+.\build_portable.ps1 -Cuda   # GPU acceleration instead of CPU-only (~4GB larger)
 ```
 
 Run it directly **on the target server** if that machine has internet access — no need
@@ -136,7 +141,7 @@ which GPU has fewer processes/contexts and pin to that one.
 
 `run.bat` sources it on every start.
 
-The build script installs the `cu128` torch build by default (matching the amd64
+With `-Cuda`, the build script installs the `cu128` torch build (matching the amd64
 Docker image). If the target server's driver has a different CUDA ceiling, edit the
 `--index-url` in `build_portable.ps1` — see
 [docs/torch-cuda-version.md](docs/torch-cuda-version.md).
