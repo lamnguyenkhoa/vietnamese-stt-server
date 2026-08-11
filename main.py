@@ -15,10 +15,11 @@ from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 from download_model import REPO_ID
 
-MODEL_DIR = os.environ.get("MODEL_DIR", REPO_ID)
+MODEL_DIR = os.environ.get("MODEL_DIR", "models")
 SAMPLE_RATE = 16000
 STREAM_CHUNK_SECONDS = 3.0
 SILENCE_RMS_THRESHOLD = 0.01
+AUTO_STOP_SILENCE_SECONDS = float(os.environ.get("AUTO_STOP_SILENCE_SECONDS", "2.0"))
 
 # Resolve ffmpeg: explicit override, then PATH, then a copy bundled alongside the app
 # (used by the portable Windows package, which ships its own ffmpeg.exe).
@@ -128,6 +129,8 @@ async def transcribe_stream(websocket: WebSocket):
     await websocket.accept()
     chunk_samples = int(STREAM_CHUNK_SECONDS * SAMPLE_RATE)
     buffer = np.empty(0, dtype=np.float32)
+    speech_detected = False
+    silence_seconds = 0.0
 
     try:
         while True:
@@ -137,7 +140,16 @@ async def transcribe_stream(websocket: WebSocket):
 
             if "bytes" in message and message["bytes"] is not None:
                 pcm16 = np.frombuffer(message["bytes"], dtype=np.int16)
-                buffer = np.concatenate([buffer, pcm16.astype(np.float32) / 32768.0])
+                chunk = pcm16.astype(np.float32) / 32768.0
+                buffer = np.concatenate([buffer, chunk])
+
+                if len(chunk) > 0:
+                    if is_silent(chunk):
+                        if speech_detected:
+                            silence_seconds += len(chunk) / SAMPLE_RATE
+                    else:
+                        speech_detected = True
+                        silence_seconds = 0.0
 
                 if len(buffer) >= chunk_samples:
                     if is_silent(buffer):
@@ -147,6 +159,15 @@ async def transcribe_stream(websocket: WebSocket):
                     buffer = np.empty(0, dtype=np.float32)
                     if text:
                         await websocket.send_json({"text": text, "final": False})
+
+                if speech_detected and silence_seconds >= AUTO_STOP_SILENCE_SECONDS:
+                    if len(buffer) > 0 and not is_silent(buffer):
+                        text = transcribe_array(buffer)
+                        if text:
+                            await websocket.send_json({"text": text, "final": True})
+                    await websocket.send_json({"event": "auto_stop"})
+                    await websocket.close()
+                    return
 
             elif message.get("text") == "end":
                 if len(buffer) > 0 and not is_silent(buffer):
@@ -162,3 +183,13 @@ async def transcribe_stream(websocket: WebSocket):
 @app.get("/health")
 async def health():
     return {"status": "ok", "device": device, "model": REPO_ID}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", "8000")),
+    )

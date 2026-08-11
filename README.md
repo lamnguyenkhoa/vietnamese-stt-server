@@ -1,6 +1,6 @@
 # Vietnamese STT Server
 
-A FastAPI server that transcribes audio to text using [PhoWhisper-medium](https://huggingface.co/vinai/PhoWhisper-medium).
+A FastAPI server that transcribes audio to text using [PhoWhisper-small](https://huggingface.co/vinai/PhoWhisper-small).
 
 ## Prerequisites
 
@@ -97,20 +97,27 @@ embeddable distribution, not a venv — no dependency on any Python already inst
 the target machine), CUDA torch and all deps, a static ffmpeg build, plus the app code
 and model weights. Nothing needs to be pre-installed on the target server.
 
+The script is fully self-contained — the app source (`main.py`, `download_model.py`,
+`requirements.txt`, `static/index.html`) is embedded directly in it, so it does **not**
+need a repo checkout or pre-downloaded model weights. You can copy just this one file
+anywhere and run it there.
+
 Run this from **PowerShell** (not Git Bash/WSL — the script uses PowerShell syntax):
 
 ```powershell
-python download_model.py      # if you haven't already
 .\build_portable.ps1
 ```
 
-The build machine needs internet access (it downloads the Python embeddable zip, pip,
-and a static ffmpeg build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds));
-the target server does not.
+Run it directly **on the target server** if that machine has internet access — no need
+to build on a dev machine and copy a zip over. It downloads the Python embeddable zip,
+pip, model weights from Hugging Face, and a static ffmpeg build from
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds). If the target server has no
+internet access, run it on a dev machine instead, then zip and copy the output folder
+over.
 
-This produces `dist\vietnamese-stt-server-portable\`. Copy the whole folder to the
-target server and run `run.bat`. It sets `MODEL_DIR` and `FFMPEG_BIN` to point at the
-bundled copies and starts uvicorn — same API as the Docker deployment.
+This produces `dist\vietnamese-stt-server-portable\`. Run `run.bat` from that folder (or
+copy the whole folder to another machine first). It sets `MODEL_DIR` and `FFMPEG_BIN` to
+point at the bundled copies and starts uvicorn — same API as the Docker deployment.
 
 To change the host/port after building (e.g. on the target server, no rebuild needed),
 edit `config.bat` in the output folder:
@@ -208,4 +215,4 @@ asyncio.run(main())
 
 | Env var | Default | Description |
 |-|-|
-| `MODEL_DIR` | `vinai/PhoWhisper-medium` | Local path or HF repo ID for model weights |
+| `MODEL_DIR` | `vinai/PhoWhisper-small` | Local path or HF repo ID for model weights |

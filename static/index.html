@@ -63,6 +63,11 @@ startBtn.onclick = async () => {
   ws.onerror = (e) => (statusEl.textContent = "error: " + e.message);
   ws.onmessage = (event) => {
     const msg = JSON.parse(event.data);
+    if (msg.event === "auto_stop") {
+      stopRecording({ sendEnd: false });
+      statusEl.textContent = "stopped (silence detected)";
+      return;
+    }
     finalText += (finalText ? " " : "") + msg.text;
     transcriptEl.textContent = finalText;
   };
@@ -78,7 +83,7 @@ startBtn.onclick = async () => {
   processor.connect(audioCtx.destination);
 };
 
-stopBtn.onclick = () => {
+function stopRecording({ sendEnd }) {
   startBtn.disabled = false;
   stopBtn.disabled = true;
   statusEl.textContent = "stopping...";
@@ -88,10 +93,12 @@ stopBtn.onclick = () => {
   stream && stream.getTracks().forEach((t) => t.stop());
   audioCtx && audioCtx.close();
 
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (sendEnd && ws && ws.readyState === WebSocket.OPEN) {
     ws.send("end");
   }
-};
+}
+
+stopBtn.onclick = () => stopRecording({ sendEnd: true });
 </script>
 </body>
 </html>
