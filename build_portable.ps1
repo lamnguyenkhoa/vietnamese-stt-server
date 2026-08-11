@@ -1,14 +1,17 @@
 <#
 Builds a self-contained, portable folder for running the STT server on a Windows
-server without Docker or a pre-installed Python/ffmpeg. Downloads the official Python
+server without a pre-installed Python/ffmpeg. Downloads the official Python
 embeddable distribution (a standalone runtime, not a venv -- no dependency on any
 Python already present on the target machine), bootstraps pip into it, installs all
-deps, downloads a static ffmpeg build and the model weights, and writes out the app
-code (embedded in this script -- no repo checkout needed).
+deps, downloads and converts the model weights, downloads a static ffmpeg build, and
+writes out the app code (embedded in this script -- no repo checkout needed).
 
-By default this installs CPU-only torch, which keeps the output folder small
-(a few hundred MB instead of several GB) -- pass -Cuda to install CUDA 12.8 torch
-instead for GPU acceleration (adds ~4GB).
+The app runs on faster-whisper (CTranslate2), not PyTorch, so the runtime footprint
+is small (~200-300MB for the Python/deps, no multi-GB torch install) and the model
+ships int8-quantized (~240MB instead of ~460MB+ fp16/fp32). GPU acceleration works
+automatically at runtime if the target machine has a compatible NVIDIA driver and
+CUDA/cuDNN available (see the GPU note in README.md) -- no separate build flag needed,
+unlike the old torch-based build.
 
 This script is fully self-contained: copy just this one file to the target machine
 and run it there, or run it on a dev machine and copy the resulting output folder.
@@ -16,10 +19,11 @@ and run it there, or run it on a dev machine and copy the resulting output folde
 Usage:
     .\build_portable.ps1
     .\build_portable.ps1 -OutDir C:\deploy\vietnamese-stt-server
-    .\build_portable.ps1 -Cuda
 
 Requires: internet access on the machine running this script (to fetch the embeddable
-Python, pip, ffmpeg, and the model weights from Hugging Face).
+Python, pip, ffmpeg, and the model weights from Hugging Face). Model conversion
+temporarily installs CPU torch + transformers to do the one-time CTranslate2
+conversion, then uninstalls them -- they are not part of the shipped output.
 #>
 
 param(
@@ -27,11 +31,7 @@ param(
     [string]$PythonVersion = "3.13.12",
     # BtbN/FFmpeg-Builds release asset, pinned to the n8.1 release build (static, GPL),
     # not the rolling nightly "master" build, so the ffmpeg version stays predictable.
-    [string]$FfmpegAssetUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip",
-    # Install CUDA 12.8 torch for GPU acceleration instead of the default CPU-only
-    # build. Adds ~4GB to the output folder -- see docs/torch-cuda-version.md if the
-    # target machine's driver doesn't support CUDA 12.8.
-    [switch]$Cuda
+    [string]$FfmpegAssetUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip"
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,16 +50,16 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import ctranslate2
 import numpy as np
 import soundfile as sf
-import torch
+from faster_whisper import WhisperModel
 from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 from download_model import REPO_ID
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "models")
+MODEL_DIR = os.environ.get("MODEL_DIR", "models-ct2")
 SAMPLE_RATE = 16000
 STREAM_CHUNK_SECONDS = 3.0
 SILENCE_RMS_THRESHOLD = 0.01
@@ -88,12 +88,33 @@ def resolve_device() -> str:
     requested = os.environ.get("DEVICE", "auto").lower()
     if requested not in ("auto", "cuda", "cpu"):
         raise ValueError(f"Invalid DEVICE={requested!r}; expected 'auto', 'cuda', or 'cpu'")
+    cuda_available = ctranslate2.get_cuda_device_count() > 0
     if requested == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    if requested == "cuda" and not torch.cuda.is_available():
+        return "cuda" if cuda_available else "cpu"
+    if requested == "cuda" and not cuda_available:
         logger.warning("DEVICE=cuda requested but CUDA is not available; falling back to CPU.")
         return "cpu"
     return requested
+
+
+def resolve_compute_type(resolved_device: str) -> str:
+    """Pick a CTranslate2 compute type: int8 on CPU (fast + small), float16 on GPU
+    (CUDA has real fp16 hardware acceleration, unlike CPU). Override with COMPUTE_TYPE."""
+    requested = os.environ.get("COMPUTE_TYPE")
+    if requested:
+        return requested
+    return "float16" if resolved_device == "cuda" else "int8"
+
+
+def _load_model(target_device: str) -> "WhisperModel":
+    model = WhisperModel(
+        MODEL_DIR, device=target_device, compute_type=resolve_compute_type(target_device)
+    )
+    # cuBLAS/cuDNN are loaded lazily on first inference, not at model construction --
+    # a missing/unreachable CUDA runtime only raises here. Force that to happen now,
+    # during startup, rather than on a user's first request.
+    list(model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="vi")[0])
+    return model
 
 
 @asynccontextmanager
@@ -103,16 +124,21 @@ async def lifespan(app: FastAPI):
     if device == "cpu":
         logger.warning(
             "Running on CPU. If a GPU was expected, check the driver's CUDA ceiling "
-            "(nvidia-smi) against the torch build installed (see docs/torch-cuda-version.md)."
+            "(nvidia-smi) against the ctranslate2 build installed."
         )
 
-    model_state["processor"] = WhisperProcessor.from_pretrained(MODEL_DIR)
-    model = WhisperForConditionalGeneration.from_pretrained(MODEL_DIR).to(device).eval()
-    if device == "cpu":
-        # fp16 has no real hardware acceleration on CPU in PyTorch and is often
-        # slower than fp32 there (unlike on CUDA, where fp16 is a speedup).
-        model = model.float()
-    model_state["model"] = model
+    try:
+        model_state["model"] = _load_model(device)
+    except Exception:
+        # get_cuda_device_count() only confirms a CUDA-capable GPU + driver exist, not
+        # that cuBLAS/cuDNN are actually loadable (e.g. missing on the host, or not on
+        # PATH) -- that failure only surfaces here, at model load. Fall back to CPU
+        # rather than crash the whole server on startup.
+        if device != "cuda":
+            raise
+        logger.exception("Failed to load model on cuda; falling back to CPU.")
+        device = "cpu"
+        model_state["model"] = _load_model(device)
     yield
     model_state.clear()
 
@@ -156,19 +182,14 @@ def load_audio(raw_bytes: bytes) -> "list[float]":
 
 
 def transcribe_array(audio: "np.ndarray") -> str:
-    processor = model_state["processor"]
     model = model_state["model"]
-
-    inputs = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-    input_features = inputs.input_features.to(device, dtype=next(model.parameters()).dtype)
-
-    with torch.no_grad():
-        predicted_ids = model.generate(input_features, language="vi", task="transcribe")
-
-    text = processor.batch_decode(
-        predicted_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0]
-    return text.strip()
+    # beam_size=1 (greedy) matches the decoding this PhoWhisper checkpoint was
+    # actually used with before this migration (transformers' plain .generate(), which
+    # defaults to greedy). faster-whisper's own default, beam_size=5, was measurably
+    # worse on this fine-tune -- e.g. "áo đỏ" (red shirt) misdecoded as "áo đảo" on a
+    # real test clip, an error greedy decoding doesn't make.
+    segments, _ = model.transcribe(audio, language="vi", task="transcribe", beam_size=1)
+    return " ".join(segment.text.strip() for segment in segments).strip()
 
 
 @app.post("/transcribe")
@@ -265,7 +286,11 @@ if __name__ == "__main__":
 '@
 
 $DownloadModelPy = @'
-"""Fetch PhoWhisper-small's files (config, tokenizer, and weights) into models/."""
+"""Fetch PhoWhisper-small's raw HF files (config, tokenizer, and weights) into models/.
+
+This is a staging download only -- the app itself runs on the CTranslate2 format
+produced by convert_ct2.py from these files, not on this directory directly.
+"""
 from huggingface_hub import snapshot_download
 
 REPO_ID = "vinai/PhoWhisper-small"
@@ -277,15 +302,42 @@ if __name__ == "__main__":
         allow_patterns=["*.json", "*.txt", "vocab.*", "merges.txt", "*.model", "pytorch_model.bin"],
     )
 
-    print("Done. Model files are now in models/")
+    print("Done. Model files are now in models/. Run convert_ct2.py next.")
+'@
+
+$ConvertCt2Py = @'
+"""Convert models/ (raw HF PhoWhisper weights, from download_model.py) into
+CTranslate2 format in models-ct2/, quantized to int8. This is what main.py actually
+loads at runtime via faster-whisper.
+
+Requires transformers and torch installed -- only for this one-time conversion, not
+at runtime.
+"""
+from ctranslate2.converters import TransformersConverter
+
+COPY_FILES = [
+    "tokenizer.json",
+    "preprocessor_config.json",
+    "normalizer.json",
+    "added_tokens.json",
+    "special_tokens_map.json",
+    "vocab.json",
+    "merges.txt",
+    "generation_config.json",
+]
+
+if __name__ == "__main__":
+    converter = TransformersConverter("models", copy_files=COPY_FILES)
+    converter.convert("models-ct2", quantization="int8", force=True)
+
+    print("Done. CTranslate2 model is now in models-ct2/")
 '@
 
 $RequirementsTxt = @'
 fastapi
 uvicorn[standard]
 python-multipart
-transformers
-accelerate
+faster-whisper
 huggingface_hub
 soundfile
 numpy
@@ -515,6 +567,7 @@ $OutDir = (Resolve-Path $OutDir).Path
 Write-Host "Writing app source..."
 Set-Content -Path (Join-Path $OutDir "main.py") -Value $MainPy -Encoding UTF8
 Set-Content -Path (Join-Path $OutDir "download_model.py") -Value $DownloadModelPy -Encoding UTF8
+Set-Content -Path (Join-Path $OutDir "convert_ct2.py") -Value $ConvertCt2Py -Encoding UTF8
 New-Item -ItemType Directory -Force -Path (Join-Path $OutDir "static") | Out-Null
 Set-Content -Path (Join-Path $OutDir "static\index.html") -Value $IndexHtml -Encoding UTF8
 $RequirementsPath = Join-Path $OutDir "requirements.txt"
@@ -544,16 +597,14 @@ Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile $GetPipPa
 & $PyExe $GetPipPath --no-warn-script-location
 Remove-Item $GetPipPath
 
-if ($Cuda) {
-    Write-Host "Installing torch (CUDA 12.8 build)..."
-    & $PyExe -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu128
-} else {
-    Write-Host "Installing torch (CPU-only build)..."
-    & $PyExe -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-}
-
-Write-Host "Installing remaining requirements..."
+Write-Host "Installing requirements (faster-whisper, fastapi, etc.)..."
 & $PyExe -m pip install --no-cache-dir -r $RequirementsPath
+
+# Snapshot installed packages now, so the conversion-only torch/transformers install
+# below (and their transitive deps, e.g. sympy/networkx/mpmath) can be fully removed
+# afterward by diffing against this baseline -- `pip uninstall torch transformers`
+# alone leaves their dependencies behind as dead weight.
+$BaselinePackages = (& $PyExe -m pip freeze) | ForEach-Object { ($_ -split "==")[0].ToLower() }
 
 Write-Host "Downloading model weights..."
 Push-Location $OutDir
@@ -563,28 +614,34 @@ try {
     Pop-Location
 }
 
-# Convert to fp16 safetensors to roughly halve the weights on disk (923MB -> ~460MB).
-# Safe for CPU too: main.py upcasts back to fp32 before running inference on CPU, so
-# this only affects disk size, not runtime precision or speed.
-Write-Host "Converting model weights to fp16 (halves size on disk)..."
-$ConvertFp16Py = @'
-import torch
-from transformers import WhisperForConditionalGeneration
+# Convert to CTranslate2 int8 format (~240MB, vs ~923MB for the raw fp32 weights).
+# This needs transformers+torch temporarily to load the HF checkpoint -- installed
+# here, then uninstalled once the conversion is done so they aren't part of the
+# shipped output. CPU torch is fine even for a GPU deployment: it's only used to
+# read the weights, not to run them.
+Write-Host "Installing transformers+torch temporarily for model conversion..."
+& $PyExe -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+& $PyExe -m pip install --no-cache-dir transformers
 
-model = WhisperForConditionalGeneration.from_pretrained("models", torch_dtype=torch.float32)
-model.half()
-model.save_pretrained("models")
-'@
-$ConvertFp16Path = Join-Path $OutDir "_convert_fp16.py"
-Set-Content -Path $ConvertFp16Path -Value $ConvertFp16Py -Encoding UTF8
+Write-Host "Converting model weights to CTranslate2 int8 format..."
 Push-Location $OutDir
 try {
-    & $PyExe _convert_fp16.py
+    & $PyExe convert_ct2.py
 } finally {
     Pop-Location
 }
-Remove-Item $ConvertFp16Path
-Remove-Item (Join-Path $OutDir "models\pytorch_model.bin") -ErrorAction SilentlyContinue
+
+Write-Host "Removing conversion-only packages (torch, transformers, and their deps)..."
+& $PyExe -m pip uninstall -y torch transformers
+$CurrentPackages = (& $PyExe -m pip freeze) | ForEach-Object { ($_ -split "==")[0] }
+$Orphans = $CurrentPackages | Where-Object { $BaselinePackages -notcontains $_.ToLower() }
+if ($Orphans) {
+    Write-Host "Also removing leftover transitive deps: $($Orphans -join ', ')"
+    & $PyExe -m pip uninstall -y @Orphans
+}
+
+Remove-Item (Join-Path $OutDir "models") -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $OutDir "convert_ct2.py") -ErrorAction SilentlyContinue
 
 Write-Host "Downloading static ffmpeg build..."
 $BinDir = Join-Path $OutDir "bin"
@@ -608,7 +665,10 @@ REM Edit these values, then restart run.bat to apply them.
 set HOST=0.0.0.0
 set PORT=8000
 
-REM Force "cuda" or "cpu", or leave as "auto" to use CUDA when available.
+REM Force "cuda" or "cpu", or leave as "auto" to use CUDA when available. GPU mode
+REM requires a compatible NVIDIA driver plus CUDA/cuDNN available on this machine --
+REM the shipped build itself has no CUDA runtime bundled (unlike the old torch build),
+REM so this only works if the target machine already has them installed.
 set DEVICE=auto
 
 REM On a multi-GPU machine, pin to one GPU (e.g. "0" or "1") to avoid contention with
@@ -623,7 +683,7 @@ setlocal
 cd /d "%~dp0"
 call "%~dp0config.bat"
 title Vietnamese STT Server (port %PORT%)
-set MODEL_DIR=%~dp0models
+set MODEL_DIR=%~dp0models-ct2
 set FFMPEG_BIN=%~dp0bin\ffmpeg.exe
 "%~dp0python\python.exe" -m uvicorn main:app --host %HOST% --port %PORT%
 '@

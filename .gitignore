@@ -3,6 +3,7 @@ __pycache__
 *.pyc
 server.log
 models
+models-ct2
 dist
 *.zip
 *.rar

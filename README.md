@@ -2,115 +2,77 @@
 
 A FastAPI server that transcribes audio to text using [PhoWhisper-small](https://huggingface.co/vinai/PhoWhisper-small).
 
+The app runs on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
+not PyTorch — no multi-GB torch/CUDA install, and the model ships int8-quantized
+(~240MB instead of ~1GB+ in fp32/fp16). CPU inference is fast enough to use directly;
+GPU acceleration is opt-in where available (see below).
+
 ## Prerequisites
 
-- Docker (with NVIDIA Container Toolkit if you want GPU acceleration)
-- Model weights in `models/` (see below)
+- Python 3.11+ (or use the portable Windows build below, which bundles its own)
+- `ffmpeg` and `libsndfile` installed on the host
+- Model weights, converted to CTranslate2 format (see below)
 
 ### Getting the model weights
 
-Fetch the model files (config, tokenizer, and `pytorch_model.bin`, ~3GB) into `models/`:
+Fetch PhoWhisper-small's raw HF files into `models/`, then convert them to the
+CTranslate2 int8 format the app actually runs on:
 
 ```bash
 python download_model.py
+python convert_ct2.py
 ```
 
-The build then copies `models/` into the image, so the resulting image is self-contained — no volume mount needed at runtime.
+`convert_ct2.py` needs `transformers` and `torch` installed (only for this one-time
+conversion — `pip install transformers torch`; CPU-only torch is fine even for a GPU
+deployment, since it's only used to read the weights, not run them). Neither is needed
+at runtime. This produces `models-ct2/` (~240MB).
 
-## Build the image
-
-```bash
-docker build -t khoalamphilong/vietnamese-stt-server .
-```
-
-This builds for your host architecture. amd64 gets a CUDA 12.8 PyTorch build; arm64 gets
-a CUDA 13.0 build (PyTorch's `cu128` index has no arm64 wheels, but `cu130` does).
-
-The arm64 GPU build only works if the target machine's driver supports CUDA 13.0+
-(check with `nvidia-smi` — see [docs/torch-cuda-version.md](docs/torch-cuda-version.md)
-for how to read the "CUDA Version" ceiling). If your arm64 target's driver only covers
-12.x, edit the `arm64` branch in the [Dockerfile](Dockerfile) to `pip install torch`
-(no index URL) for a CPU-only build instead.
-
-### Building for arm64 / multi-arch
-
-Requires [Docker Buildx](https://docs.docker.com/build/buildx/) (bundled with modern
-Docker Desktop; on Linux you may need `docker buildx create --use` once).
-
-Build an arm64 image while on an amd64 host (or vice versa) via emulation:
-
-```bash
-docker buildx build --platform linux/arm64 -t khoalamphilong/vietnamese-stt-server:arm64 --load .
-```
-
-Or build and push a single multi-arch manifest covering both architectures at once
-(requires pushing to a registry — `--load` doesn't support multi-platform images):
-
-```bash
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t khoalamphilong/vietnamese-stt-server:latest --push .
-```
-
-## Run the image
-
-GPU (requires NVIDIA Container Toolkit):
-
-```bash
-docker run --gpus all -p 8000:8000 vietnamese-stt-server
-```
-
-CPU only:
-
-```bash
-docker run -p 8000:8000 vietnamese-stt-server
-```
-
-## Run the server without Docker
+## Run the server
 
 ```bash
 python -m venv venv
 ./venv/Scripts/activate      # Windows
 pip install -r requirements.txt
+python download_model.py
+python convert_ct2.py        # needs `pip install transformers torch` first
 ```
 
-Then start it with the provided script (uses local `models/` by default):
-
-```bash
-./run.sh
-```
-
-Or directly:
+Then start it:
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Requires `ffmpeg` and `libsndfile` installed on the host.
-
 Then you can go to localhost:8000/docs to test it.
 
-## Portable Windows deployment (no Docker)
+**GPU note:** `faster-whisper`'s CTranslate2 backend doesn't bundle its own CUDA
+runtime the way PyTorch's pip wheels do, so GPU acceleration requires a compatible
+NVIDIA driver plus cuBLAS/cuDNN already available on the host (see
+[docs/torch-cuda-version.md](docs/torch-cuda-version.md)). `DEVICE=auto` (the default)
+falls back to CPU automatically if that's not the case.
 
-For Windows servers where Docker isn't available/allowed, [build_portable.ps1](build_portable.ps1)
-packages the app into a self-contained folder: a standalone Python (the official
-embeddable distribution, not a venv — no dependency on any Python already installed on
-the target machine), torch and all deps, a static ffmpeg build, plus the app code
-and model weights. Nothing needs to be pre-installed on the target server.
+## Portable Windows deployment
 
-By default this installs CPU-only torch, keeping the output folder small (a few
-hundred MB) and easy to copy between machines. Pass `-Cuda` to install CUDA 12.8 torch
-instead for GPU acceleration — this adds ~4GB to the output.
+[build_portable.ps1](build_portable.ps1) packages the app into a self-contained
+folder: a standalone Python (the official embeddable distribution, not a venv — no
+dependency on any Python already installed on the target machine), faster-whisper and
+all deps, a static ffmpeg build, plus the app code and the int8-quantized model.
+Nothing needs to be pre-installed on the target server. Since there's no torch runtime
+dependency, the output folder is small (~700MB, mostly Python + the model) and easy to
+copy between machines.
 
 The script is fully self-contained — the app source (`main.py`, `download_model.py`,
-`requirements.txt`, `static/index.html`) is embedded directly in it, so it does **not**
-need a repo checkout or pre-downloaded model weights. You can copy just this one file
-anywhere and run it there.
+`convert_ct2.py`, `requirements.txt`, `static/index.html`) is embedded directly in it,
+so it does **not** need a repo checkout or pre-downloaded model weights. You can copy
+just this one file anywhere and run it there. It does temporarily install CPU torch +
+transformers mid-build to do the one-time model conversion, then uninstalls them
+before finishing — they never end up in the shipped output.
 
 Run this from **PowerShell** (not Git Bash/WSL — the script uses PowerShell syntax):
 
 ```powershell
 .\build_portable.ps1
-.\build_portable.ps1 -Cuda   # GPU acceleration instead of CPU-only (~4GB larger)
 ```
 
 Run it directly **on the target server** if that machine has internet access — no need
@@ -122,7 +84,7 @@ over.
 
 This produces `dist\vietnamese-stt-server-portable\`. Run `run.bat` from that folder (or
 copy the whole folder to another machine first). It sets `MODEL_DIR` and `FFMPEG_BIN` to
-point at the bundled copies and starts uvicorn — same API as the Docker deployment.
+point at the bundled copies and starts uvicorn.
 
 To change the host/port after building (e.g. on the target server, no rebuild needed),
 edit `config.bat` in the output folder:
@@ -133,18 +95,15 @@ set PORT=8000
 set CUDA_VISIBLE_DEVICES=
 ```
 
+By default `DEVICE=auto` in `config.bat`, which uses GPU only if the target machine
+already has a compatible NVIDIA driver and CUDA/cuDNN runtime available — the portable
+build itself doesn't bundle a CUDA runtime (see the GPU note above: CTranslate2's pip
+wheel doesn't ship one). CPU (int8) is what this build is optimized for.
+
 `CUDA_VISIBLE_DEVICES` is useful on a multi-GPU machine shared with other processes:
-set it to `0` or `1` to pin the server to a specific, less-contended GPU. If you see
-`torch.AcceleratorError: CUDA-capable device(s) is/are busy or unavailable` at startup
-on a machine with several other CUDA processes already running, check `nvidia-smi` for
-which GPU has fewer processes/contexts and pin to that one.
+set it to `0` or `1` to pin the server to a specific, less-contended GPU.
 
-`run.bat` sources it on every start.
-
-With `-Cuda`, the build script installs the `cu128` torch build (matching the amd64
-Docker image). If the target server's driver has a different CUDA ceiling, edit the
-`--index-url` in `build_portable.ps1` — see
-[docs/torch-cuda-version.md](docs/torch-cuda-version.md).
+`run.bat` sources `config.bat` on every start.
 
 ## API
 
@@ -220,4 +179,6 @@ asyncio.run(main())
 
 | Env var | Default | Description |
 |-|-|
-| `MODEL_DIR` | `vinai/PhoWhisper-small` | Local path or HF repo ID for model weights |
+| `MODEL_DIR` | `models-ct2` | Path to the CTranslate2-format model directory (see `convert_ct2.py`) |
+| `DEVICE` | `auto` | `cuda`, `cpu`, or `auto` to use GPU when available |
+| `COMPUTE_TYPE` | `int8` on CPU, `float16` on GPU | CTranslate2 compute type, e.g. `int8`, `int8_float16`, `float16`, `float32` |

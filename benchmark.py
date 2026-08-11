@@ -4,36 +4,31 @@ import time
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-import torch
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+import ctranslate2
+from faster_whisper import WhisperModel
 
-from main import SAMPLE_RATE, load_audio
+from main import load_audio
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "vinai/PhoWhisper-medium")
+MODEL_DIR = os.environ.get("MODEL_DIR", "models-ct2")
 AUDIO_PATH = "data/ao-do-quan-den.mp3"
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+compute_type = "float16" if device == "cuda" else "int8"
 
 
-def transcribe(processor, model, audio):
-    inputs = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-    input_features = inputs.input_features.to(device)
-
+def transcribe(model, audio):
     start = time.perf_counter()
-    with torch.no_grad():
-        predicted_ids = model.generate(input_features)
+    segments, _ = model.transcribe(audio, language="vi", task="transcribe", beam_size=1)
+    text = " ".join(segment.text.strip() for segment in segments).strip()
     elapsed = time.perf_counter() - start
-
-    text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-    return text.strip(), elapsed
+    return text, elapsed
 
 
 def main():
-    print(f"Device: {device}")
+    print(f"Device: {device} (compute_type={compute_type})")
 
     t0 = time.perf_counter()
-    processor = WhisperProcessor.from_pretrained(MODEL_DIR)
-    model = WhisperForConditionalGeneration.from_pretrained(MODEL_DIR).to(device).eval()
+    model = WhisperModel(MODEL_DIR, device=device, compute_type=compute_type)
     load_time = time.perf_counter() - t0
     print(f"Model load time: {load_time:.2f}s")
 
@@ -42,7 +37,7 @@ def main():
     audio = load_audio(raw_bytes)
 
     for run in (1, 2):
-        text, elapsed = transcribe(processor, model, audio)
+        text, elapsed = transcribe(model, audio)
         label = "warm-up" if run == 1 else "second run"
         print(f"Run {run} ({label}): {elapsed:.2f}s -> {text!r}")
 

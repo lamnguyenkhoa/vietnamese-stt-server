@@ -6,16 +6,16 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import ctranslate2
 import numpy as np
 import soundfile as sf
-import torch
+from faster_whisper import WhisperModel
 from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 from download_model import REPO_ID
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "models")
+MODEL_DIR = os.environ.get("MODEL_DIR", "models-ct2")
 SAMPLE_RATE = 16000
 STREAM_CHUNK_SECONDS = 3.0
 SILENCE_RMS_THRESHOLD = 0.01
@@ -44,12 +44,33 @@ def resolve_device() -> str:
     requested = os.environ.get("DEVICE", "auto").lower()
     if requested not in ("auto", "cuda", "cpu"):
         raise ValueError(f"Invalid DEVICE={requested!r}; expected 'auto', 'cuda', or 'cpu'")
+    cuda_available = ctranslate2.get_cuda_device_count() > 0
     if requested == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    if requested == "cuda" and not torch.cuda.is_available():
+        return "cuda" if cuda_available else "cpu"
+    if requested == "cuda" and not cuda_available:
         logger.warning("DEVICE=cuda requested but CUDA is not available; falling back to CPU.")
         return "cpu"
     return requested
+
+
+def resolve_compute_type(resolved_device: str) -> str:
+    """Pick a CTranslate2 compute type: int8 on CPU (fast + small), float16 on GPU
+    (CUDA has real fp16 hardware acceleration, unlike CPU). Override with COMPUTE_TYPE."""
+    requested = os.environ.get("COMPUTE_TYPE")
+    if requested:
+        return requested
+    return "float16" if resolved_device == "cuda" else "int8"
+
+
+def _load_model(target_device: str) -> "WhisperModel":
+    model = WhisperModel(
+        MODEL_DIR, device=target_device, compute_type=resolve_compute_type(target_device)
+    )
+    # cuBLAS/cuDNN are loaded lazily on first inference, not at model construction --
+    # a missing/unreachable CUDA runtime only raises here. Force that to happen now,
+    # during startup, rather than on a user's first request.
+    list(model.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), language="vi")[0])
+    return model
 
 
 @asynccontextmanager
@@ -59,16 +80,21 @@ async def lifespan(app: FastAPI):
     if device == "cpu":
         logger.warning(
             "Running on CPU. If a GPU was expected, check the driver's CUDA ceiling "
-            "(nvidia-smi) against the torch build installed (see docs/torch-cuda-version.md)."
+            "(nvidia-smi) against the ctranslate2 build installed."
         )
 
-    model_state["processor"] = WhisperProcessor.from_pretrained(MODEL_DIR)
-    model = WhisperForConditionalGeneration.from_pretrained(MODEL_DIR).to(device).eval()
-    if device == "cpu":
-        # fp16 has no real hardware acceleration on CPU in PyTorch and is often
-        # slower than fp32 there (unlike on CUDA, where fp16 is a speedup).
-        model = model.float()
-    model_state["model"] = model
+    try:
+        model_state["model"] = _load_model(device)
+    except Exception:
+        # get_cuda_device_count() only confirms a CUDA-capable GPU + driver exist, not
+        # that cuBLAS/cuDNN are actually loadable (e.g. missing on the host, or not on
+        # PATH) -- that failure only surfaces here, at model load. Fall back to CPU
+        # rather than crash the whole server on startup.
+        if device != "cuda":
+            raise
+        logger.exception("Failed to load model on cuda; falling back to CPU.")
+        device = "cpu"
+        model_state["model"] = _load_model(device)
     yield
     model_state.clear()
 
@@ -112,19 +138,14 @@ def load_audio(raw_bytes: bytes) -> "list[float]":
 
 
 def transcribe_array(audio: "np.ndarray") -> str:
-    processor = model_state["processor"]
     model = model_state["model"]
-
-    inputs = processor(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt")
-    input_features = inputs.input_features.to(device, dtype=next(model.parameters()).dtype)
-
-    with torch.no_grad():
-        predicted_ids = model.generate(input_features, language="vi", task="transcribe")
-
-    text = processor.batch_decode(
-        predicted_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0]
-    return text.strip()
+    # beam_size=1 (greedy) matches the decoding this PhoWhisper checkpoint was
+    # actually used with before this migration (transformers' plain .generate(), which
+    # defaults to greedy). faster-whisper's own default, beam_size=5, was measurably
+    # worse on this fine-tune -- e.g. "áo đỏ" (red shirt) misdecoded as "áo đảo" on a
+    # real test clip, an error greedy decoding doesn't make.
+    segments, _ = model.transcribe(audio, language="vi", task="transcribe", beam_size=1)
+    return " ".join(segment.text.strip() for segment in segments).strip()
 
 
 @app.post("/transcribe")
