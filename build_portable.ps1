@@ -71,17 +71,31 @@ def is_silent(audio: "np.ndarray") -> bool:
 
 logger = logging.getLogger("uvicorn.error")
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"  # placeholder; resolve_device() sets the real value in lifespan()
 model_state = {}
+
+
+def resolve_device() -> str:
+    """Pick cuda/cpu from the DEVICE env var (set via --device or directly), or auto-detect."""
+    requested = os.environ.get("DEVICE", "auto").lower()
+    if requested not in ("auto", "cuda", "cpu"):
+        raise ValueError(f"Invalid DEVICE={requested!r}; expected 'auto', 'cuda', or 'cpu'")
+    if requested == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        logger.warning("DEVICE=cuda requested but CUDA is not available; falling back to CPU.")
+        return "cpu"
+    return requested
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global device
+    device = resolve_device()
     if device == "cpu":
         logger.warning(
-            "torch.cuda.is_available() is False - running on CPU. "
-            "If a GPU was expected, check the driver's CUDA ceiling (nvidia-smi) "
-            "against the torch build installed (see docs/torch-cuda-version.md)."
+            "Running on CPU. If a GPU was expected, check the driver's CUDA ceiling "
+            "(nvidia-smi) against the torch build installed (see docs/torch-cuda-version.md)."
         )
 
     model_state["processor"] = WhisperProcessor.from_pretrained(MODEL_DIR)
@@ -222,13 +236,24 @@ async def health():
 
 
 if __name__ == "__main__":
+    import argparse
+
     import uvicorn
 
-    uvicorn.run(
-        app,
-        host=os.environ.get("HOST", "0.0.0.0"),
-        port=int(os.environ.get("PORT", "8000")),
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "cpu"],
+        help="Force cuda/cpu, or auto-detect (default; same as $DEVICE)",
     )
+    parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    args = parser.parse_args()
+
+    if args.device:
+        os.environ["DEVICE"] = args.device
+
+    uvicorn.run(app, host=args.host, port=args.port)
 '@
 
 $DownloadModelPy = @'
@@ -361,6 +386,111 @@ function stopRecording({ sendEnd }) {
 
 stopBtn.onclick = () => stopRecording({ sendEnd: true });
 </script>
+
+<hr />
+
+<h1>PhoWhisper Record-Then-Transcribe Test</h1>
+<p>Records locally; transcribes once (via POST /transcribe) only after you stop -- either by clicking Stop or after silence auto-stops it. No streaming.</p>
+<button id="start2">Start</button>
+<button id="stop2" disabled>Stop</button>
+<div id="status2">idle</div>
+<div id="transcript2"></div>
+
+<script>
+const startBtn2 = document.getElementById("start2");
+const stopBtn2 = document.getElementById("stop2");
+const statusEl2 = document.getElementById("status2");
+const transcriptEl2 = document.getElementById("transcript2");
+
+const VAD_SILENCE_RMS_THRESHOLD = 0.01;
+const VAD_AUTO_STOP_SILENCE_SECONDS = 2.0;
+
+let mediaRecorder2, recordedChunks2, stream2, audioCtx2, source2, vadProcessor2;
+let speechDetected2 = false;
+let silenceSeconds2 = 0;
+
+function rms(float32) {
+  let sum = 0;
+  for (let i = 0; i < float32.length; i++) sum += float32[i] * float32[i];
+  return Math.sqrt(sum / float32.length);
+}
+
+startBtn2.onclick = async () => {
+  startBtn2.disabled = true;
+  stopBtn2.disabled = false;
+  transcriptEl2.textContent = "";
+  statusEl2.textContent = "requesting mic...";
+  speechDetected2 = false;
+  silenceSeconds2 = 0;
+
+  stream2 = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+  recordedChunks2 = [];
+  mediaRecorder2 = new MediaRecorder(stream2);
+  mediaRecorder2.ondataavailable = (e) => {
+    if (e.data.size > 0) recordedChunks2.push(e.data);
+  };
+  mediaRecorder2.onstop = async () => {
+    statusEl2.textContent = "transcribing...";
+    const blob = new Blob(recordedChunks2, { type: mediaRecorder2.mimeType });
+    const formData = new FormData();
+    formData.append("file", blob, "recording.webm");
+    try {
+      const res = await fetch("/transcribe", { method: "POST", body: formData });
+      const data = await res.json();
+      transcriptEl2.textContent = data.text || "(no speech detected)";
+      statusEl2.textContent = "done";
+    } catch (err) {
+      statusEl2.textContent = "error: " + err.message;
+    }
+  };
+  mediaRecorder2.start();
+
+  // Local silence detection only decides *when* to stop recording; the audio
+  // itself is buffered client-side and sent as a single file once stopped.
+  audioCtx2 = new AudioContext();
+  source2 = audioCtx2.createMediaStreamSource(stream2);
+  vadProcessor2 = audioCtx2.createScriptProcessor(4096, 1, 1);
+  vadProcessor2.onaudioprocess = (e) => {
+    const input = e.inputBuffer.getChannelData(0);
+    const chunkDuration = input.length / audioCtx2.sampleRate;
+    if (rms(input) < VAD_SILENCE_RMS_THRESHOLD) {
+      if (speechDetected2) {
+        silenceSeconds2 += chunkDuration;
+        if (silenceSeconds2 >= VAD_AUTO_STOP_SILENCE_SECONDS) {
+          statusEl2.textContent = "stopped (silence detected)";
+          stopRecording2();
+        }
+      }
+    } else {
+      speechDetected2 = true;
+      silenceSeconds2 = 0;
+    }
+  };
+  source2.connect(vadProcessor2);
+  vadProcessor2.connect(audioCtx2.destination);
+
+  statusEl2.textContent = "recording...";
+};
+
+function stopRecording2() {
+  if (!mediaRecorder2 || mediaRecorder2.state === "inactive") return;
+  startBtn2.disabled = false;
+  stopBtn2.disabled = true;
+
+  vadProcessor2 && vadProcessor2.disconnect();
+  source2 && source2.disconnect();
+  audioCtx2 && audioCtx2.close();
+  stream2 && stream2.getTracks().forEach((t) => t.stop());
+
+  mediaRecorder2.stop();
+}
+
+stopBtn2.onclick = () => {
+  statusEl2.textContent = "stopping...";
+  stopRecording2();
+};
+</script>
 </body>
 </html>
 '@
@@ -441,6 +571,9 @@ $ConfigBat = @'
 REM Edit these values, then restart run.bat to apply them.
 set HOST=0.0.0.0
 set PORT=8000
+
+REM Force "cuda" or "cpu", or leave as "auto" to use CUDA when available.
+set DEVICE=auto
 
 REM On a multi-GPU machine, pin to one GPU (e.g. "0" or "1") to avoid contention with
 REM other processes already loaded onto a busier GPU. Leave blank to let CUDA pick.

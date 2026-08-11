@@ -35,17 +35,31 @@ def is_silent(audio: "np.ndarray") -> bool:
 
 logger = logging.getLogger("uvicorn.error")
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cpu"  # placeholder; resolve_device() sets the real value in lifespan()
 model_state = {}
+
+
+def resolve_device() -> str:
+    """Pick cuda/cpu from the DEVICE env var (set via --device or directly), or auto-detect."""
+    requested = os.environ.get("DEVICE", "auto").lower()
+    if requested not in ("auto", "cuda", "cpu"):
+        raise ValueError(f"Invalid DEVICE={requested!r}; expected 'auto', 'cuda', or 'cpu'")
+    if requested == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        logger.warning("DEVICE=cuda requested but CUDA is not available; falling back to CPU.")
+        return "cpu"
+    return requested
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global device
+    device = resolve_device()
     if device == "cpu":
         logger.warning(
-            "torch.cuda.is_available() is False - running on CPU. "
-            "If a GPU was expected, check the driver's CUDA ceiling (nvidia-smi) "
-            "against the torch build installed (see docs/torch-cuda-version.md)."
+            "Running on CPU. If a GPU was expected, check the driver's CUDA ceiling "
+            "(nvidia-smi) against the torch build installed (see docs/torch-cuda-version.md)."
         )
 
     model_state["processor"] = WhisperProcessor.from_pretrained(MODEL_DIR)
@@ -186,10 +200,21 @@ async def health():
 
 
 if __name__ == "__main__":
+    import argparse
+
     import uvicorn
 
-    uvicorn.run(
-        app,
-        host=os.environ.get("HOST", "0.0.0.0"),
-        port=int(os.environ.get("PORT", "8000")),
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "cpu"],
+        help="Force cuda/cpu, or auto-detect (default; same as $DEVICE)",
     )
+    parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    args = parser.parse_args()
+
+    if args.device:
+        os.environ["DEVICE"] = args.device
+
+    uvicorn.run(app, host=args.host, port=args.port)
