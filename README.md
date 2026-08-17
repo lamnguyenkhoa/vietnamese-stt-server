@@ -87,15 +87,15 @@ copy the whole folder to another machine first). It sets `MODEL_DIR` and `FFMPEG
 point at the bundled copies and starts uvicorn.
 
 To change the host/port after building (e.g. on the target server, no rebuild needed),
-edit `config.bat` in the output folder:
+edit `config.ini` in the output folder:
 
-```bat
-set HOST=0.0.0.0
-set PORT=8000
-set CUDA_VISIBLE_DEVICES=
+```ini
+HOST=0.0.0.0
+PORT=8000
+CUDA_VISIBLE_DEVICES=
 ```
 
-By default `DEVICE=auto` in `config.bat`, which uses GPU only if the target machine
+By default `DEVICE=auto` in `config.ini`, which uses GPU only if the target machine
 already has a compatible NVIDIA driver and CUDA/cuDNN runtime available — the portable
 build itself doesn't bundle a CUDA runtime (see the GPU note above: CTranslate2's pip
 wheel doesn't ship one). CPU (int8) is what this build is optimized for.
@@ -103,7 +103,7 @@ wheel doesn't ship one). CPU (int8) is what this build is optimized for.
 `CUDA_VISIBLE_DEVICES` is useful on a multi-GPU machine shared with other processes:
 set it to `0` or `1` to pin the server to a specific, less-contended GPU.
 
-`run.bat` sources `config.bat` on every start.
+`run.bat` reads `config.ini` on every start.
 
 ## API
 

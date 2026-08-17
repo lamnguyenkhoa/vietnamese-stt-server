@@ -659,29 +659,30 @@ Copy-Item $FfmpegExe.FullName (Join-Path $BinDir "ffmpeg.exe")
 Remove-Item $FfmpegZipPath
 Remove-Item -Recurse -Force $FfmpegExtractDir
 
-$ConfigBat = @'
-@echo off
-REM Edit these values, then restart run.bat to apply them.
-set HOST=0.0.0.0
-set PORT=8000
+$ConfigIni = @'
+; Edit these values, then restart run.bat to apply them.
+HOST=0.0.0.0
+PORT=8000
 
-REM Force "cuda" or "cpu", or leave as "auto" to use CUDA when available. GPU mode
-REM requires a compatible NVIDIA driver plus CUDA/cuDNN available on this machine --
-REM the shipped build itself has no CUDA runtime bundled (unlike the old torch build),
-REM so this only works if the target machine already has them installed.
-set DEVICE=auto
+; Force "cuda" or "cpu", or leave as "auto" to use CUDA when available. GPU mode
+; requires a compatible NVIDIA driver plus CUDA/cuDNN available on this machine --
+; the shipped build itself has no CUDA runtime bundled (unlike the old torch build),
+; so this only works if the target machine already has them installed.
+DEVICE=auto
 
-REM On a multi-GPU machine, pin to one GPU (e.g. "0" or "1") to avoid contention with
-REM other processes already loaded onto a busier GPU. Leave blank to let CUDA pick.
-set CUDA_VISIBLE_DEVICES=
+; On a multi-GPU machine, pin to one GPU (e.g. "0" or "1") to avoid contention with
+; other processes already loaded onto a busier GPU. Leave blank to let CUDA pick.
+CUDA_VISIBLE_DEVICES=
 '@
-Set-Content -Path (Join-Path $OutDir "config.bat") -Value $ConfigBat -Encoding ASCII
+Set-Content -Path (Join-Path $OutDir "config.ini") -Value $ConfigIni -Encoding ASCII
 
 $RunBat = @'
 @echo off
 setlocal
 cd /d "%~dp0"
-call "%~dp0config.bat"
+for /f "usebackq eol=; tokens=1,2 delims==" %%A in ("config.ini") do (
+    if not "%%A"=="" set "%%A=%%B"
+)
 title Vietnamese STT Server (port %PORT%)
 set MODEL_DIR=%~dp0models-ct2
 set FFMPEG_BIN=%~dp0bin\ffmpeg.exe
