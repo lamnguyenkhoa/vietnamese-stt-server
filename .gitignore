@@ -7,3 +7,4 @@ models-ct2
 dist
 *.zip
 *.rar
+vendor

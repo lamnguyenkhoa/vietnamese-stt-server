@@ -105,6 +105,35 @@ set it to `0` or `1` to pin the server to a specific, less-contended GPU.
 
 `run.bat` reads `config.ini` on every start.
 
+### Building from the local checkout (offline)
+
+[build_local.ps1](build_local.ps1) produces the same output folder, but assembled from
+what is already on this machine instead of from the internet — useful for iterating on
+a deploy, or for building on a machine with no (or slow) internet:
+
+```powershell
+.\build_local.ps1            # -> dist\vietnamese-stt-server-local\
+.\build_local.ps1 -Zip       # also writes dist\vietnamese-stt-server-local.zip
+.\build_local.ps1 -Offline   # fail instead of downloading anything
+```
+
+It takes the app code from the working tree, the model from your local `models-ct2\`
+(no Hugging Face download, no re-conversion), `ffmpeg.exe` from `PATH` (override with
+`-FfmpegExe`), and the dependencies out of `venv\Lib\site-packages` — so the build is
+seconds, not minutes, and ships exactly the package versions you tested against.
+[collect_deps.py](collect_deps.py) resolves the dependency closure of
+`requirements.txt` from the venv's installed metadata, so dev-only extras that also
+live in the venv (torch, transformers, …) are left out of the shipped folder.
+
+The one thing that can't come from the working tree is the standalone Python runtime —
+a venv has no interpreter to ship. The embeddable distribution is downloaded once and
+cached in `vendor\`, after which every build (and `-Offline`) works with no network.
+The shipped interpreter must match the venv's Python X.Y, since the copied wheels are
+built against that ABI; the script defaults to the venv's exact version.
+
+The build finishes by importing the whole stack with the bundled interpreter, so a
+missing dependency fails the build rather than the first run on the server.
+
 ## API
 
 - `POST /transcribe` — multipart file upload (`file`), returns `{"text": "..."}`
