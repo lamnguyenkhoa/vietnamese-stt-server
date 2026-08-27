@@ -64,6 +64,9 @@ $OutDir = (Resolve-Path $OutDir).Path
 
 Write-Host "Copying app source from working tree..."
 Copy-Item "main.py", "download_model.py", "requirements.txt" $OutDir
+# Records which checkpoint the app serves; absent until switch_model.py writes it,
+# in which case download_model.py falls back to its default.
+if (Test-Path "model_id.txt") { Copy-Item "model_id.txt" $OutDir }
 Copy-Item "static" (Join-Path $OutDir "static") -Recurse
 
 # ---------------------------------------------------------------------------
@@ -134,7 +137,7 @@ Copy-Item $FfmpegExe (Join-Path $BinDir "ffmpeg.exe")
 $ConfigIni = @'
 ; Edit these values, then restart run.bat to apply them.
 HOST=0.0.0.0
-PORT=8000
+PORT=8123
 
 ; Force "cuda" or "cpu", or leave as "auto" to use CUDA when available. GPU mode
 ; requires a compatible NVIDIA driver plus CUDA/cuDNN available on this machine --

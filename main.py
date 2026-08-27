@@ -2,9 +2,19 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# The portable Windows build ships the CUDA DLLs that CTranslate2 needs (cuBLAS, and
+# the cuDNN 9 sublibraries) in a "cuda" folder next to the app. They are loaded
+# lazily by name at first inference, so the folder has to be on the DLL search path
+# before then -- register it here rather than relying on the launcher's PATH.
+CUDA_DLL_DIR = Path(os.environ.get("CUDA_DLL_DIR") or Path(__file__).parent / "cuda")
+if sys.platform == "win32" and CUDA_DLL_DIR.is_dir():
+    os.add_dll_directory(str(CUDA_DLL_DIR))
+    os.environ["PATH"] = str(CUDA_DLL_DIR) + os.pathsep + os.environ.get("PATH", "")
 
 import ctranslate2
 import numpy as np
@@ -13,7 +23,7 @@ from faster_whisper import WhisperModel
 from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
-from download_model import REPO_ID
+from download_model import current_repo_id
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "models-ct2")
 SAMPLE_RATE = 16000
@@ -217,7 +227,7 @@ async def transcribe_stream(websocket: WebSocket):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "device": device, "model": REPO_ID}
+    return {"status": "ok", "device": device, "model": current_repo_id()}
 
 
 if __name__ == "__main__":
@@ -232,7 +242,7 @@ if __name__ == "__main__":
         help="Force cuda/cpu, or auto-detect (default; same as $DEVICE)",
     )
     parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8123")))
     args = parser.parse_args()
 
     if args.device:

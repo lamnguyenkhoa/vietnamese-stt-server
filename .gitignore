@@ -8,3 +8,4 @@ dist
 *.zip
 *.rar
 vendor
+model_id.txt

@@ -41,16 +41,18 @@ python convert_ct2.py        # needs `pip install transformers torch` first
 Then start it:
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8123
 ```
 
-Then you can go to localhost:8000/docs to test it.
+Then you can go to localhost:8123/docs to test it.
 
 **GPU note:** `faster-whisper`'s CTranslate2 backend doesn't bundle its own CUDA
-runtime the way PyTorch's pip wheels do, so GPU acceleration requires a compatible
-NVIDIA driver plus cuBLAS/cuDNN already available on the host (see
-[docs/torch-cuda-version.md](docs/torch-cuda-version.md)). `DEVICE=auto` (the default)
-falls back to CPU automatically if that's not the case.
+runtime the way PyTorch's pip wheels do, so GPU acceleration needs cuBLAS (CUDA 12)
+and cuDNN 9 available to the process on top of a compatible NVIDIA driver (see
+[docs/torch-cuda-version.md](docs/torch-cuda-version.md)). For a dev checkout, either
+install the CUDA toolkit or just `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12`
+into the venv; the portable build ships them (see below). `DEVICE=auto` (the default)
+falls back to CPU automatically if the runtime can't be loaded.
 
 ## Portable Windows deployment
 
@@ -58,16 +60,16 @@ falls back to CPU automatically if that's not the case.
 folder: a standalone Python (the official embeddable distribution, not a venv — no
 dependency on any Python already installed on the target machine), faster-whisper and
 all deps, a static ffmpeg build, plus the app code and the int8-quantized model.
-Nothing needs to be pre-installed on the target server. Since there's no torch runtime
-dependency, the output folder is small (~700MB, mostly Python + the model) and easy to
-copy between machines.
+Nothing needs to be pre-installed on the target server. Inference never touches torch,
+so nothing multi-GB is required to *run* the server; the default build is CPU-only and
+keeps CPU torch installed purely as the model converter (see
+[Changing the model](#changing-the-model-after-a-build) below).
 
 The script is fully self-contained — the app source (`main.py`, `download_model.py`,
-`convert_ct2.py`, `requirements.txt`, `static/index.html`) is embedded directly in it,
+`convert_ct2.py`, `switch_model.py`, `enable_gpu.py`, `requirements.txt`,
+`static/index.html`) is embedded directly in it,
 so it does **not** need a repo checkout or pre-downloaded model weights. You can copy
-just this one file anywhere and run it there. It does temporarily install CPU torch +
-transformers mid-build to do the one-time model conversion, then uninstalls them
-before finishing — they never end up in the shipped output.
+just this one file anywhere and run it there.
 
 Run this from **PowerShell** (not Git Bash/WSL — the script uses PowerShell syntax):
 
@@ -91,14 +93,40 @@ edit `config.ini` in the output folder:
 
 ```ini
 HOST=0.0.0.0
-PORT=8000
+PORT=8123
 CUDA_VISIBLE_DEVICES=
 ```
 
-By default `DEVICE=auto` in `config.ini`, which uses GPU only if the target machine
-already has a compatible NVIDIA driver and CUDA/cuDNN runtime available — the portable
-build itself doesn't bundle a CUDA runtime (see the GPU note above: CTranslate2's pip
-wheel doesn't ship one). CPU (int8) is what this build is optimized for.
+### Adding GPU support after a build
+
+The build is **CPU-only by default** — CPU int8 is what this package is best optimized
+for, and the CUDA runtime is ~1.5GB. To enable the GPU on the target machine, run
+`enable_gpu.bat` from the output folder once (needs internet). It downloads the CUDA
+runtime CTranslate2 needs (cuBLAS + cuDNN 9) into the `cuda\` folder, which `run.bat`
+already puts on the DLL search path, so the only other requirement is an NVIDIA driver
+new enough for CUDA 12 — no CUDA toolkit install. `DEVICE=auto` then picks up the GPU
+on the next start, and still falls back to CPU if the runtime can't be loaded.
+
+If the target machine has no internet access, build with `-IncludeCuda` instead to
+bundle the same DLLs up front.
+
+### Changing the model after a build
+
+The shipped checkpoint is `vinai/PhoWhisper-small`. Pick a different one at build time
+with `-Model medium`, or swap it later from the output folder:
+
+```powershell
+.\switch_model.bat medium              # tiny | base | small | medium | large
+.\switch_model.bat vinai/PhoWhisper-large
+.\switch_model.bat                     # prints the current model
+```
+
+That re-downloads the raw weights from Hugging Face, re-converts them to CTranslate2
+int8 in `models-ct2\`, and records the choice in `model_id.txt` (which `/health`
+reports). Restart `run.bat` afterwards. This is why CPU torch + transformers stay in
+the output — the CTranslate2 converter reads HF checkpoints through them, on CPU only.
+Build with `-StripTorch` to drop them (~1GB smaller) if the model never needs to
+change; `switch_model.bat` is then omitted from the output.
 
 `CUDA_VISIBLE_DEVICES` is useful on a multi-GPU machine shared with other processes:
 set it to `0` or `1` to pin the server to a specific, less-contended GPU.
@@ -143,7 +171,7 @@ missing dependency fails the build rather than the first run on the server.
 Example:
 
 ```bash
-curl -X POST http://localhost:8000/transcribe -F "file=@sample.wav"
+curl -X POST http://localhost:8123/transcribe -F "file=@sample.wav"
 ```
 
 ### Streaming transcription (`/ws/transcribe`)
@@ -155,7 +183,7 @@ result, and occasionally a word getting split across two chunks.
 
 **Protocol:**
 
-1. Open a WebSocket connection to `ws://<host>:8000/ws/transcribe`.
+1. Open a WebSocket connection to `ws://<host>:8123/ws/transcribe`.
 2. Stream raw audio as binary frames — **16-bit signed little-endian PCM, mono,
    16000 Hz** (no container/codec — do not send WAV/MP3/Opus bytes directly). If you're
    capturing from a browser mic, you'll need to downsample/convert to this format
@@ -176,7 +204,7 @@ result, and occasionally a word getting split across two chunks.
    also works, but you lose the last partial chunk.)
 
 **Try it in a browser:** start the server and open
-`http://localhost:8000/static/index.html` — it captures your mic, streams audio to
+`http://localhost:8123/static/index.html` — it captures your mic, streams audio to
 `/ws/transcribe`, and renders the transcript live.
 
 **Minimal Python client** (streaming from a WAV file for testing):
@@ -192,7 +220,7 @@ async def main():
     assert sr == 16000, "resample to 16kHz first"
     pcm16 = (audio * 32767).astype(np.int16).tobytes()
 
-    async with websockets.connect("ws://localhost:8000/ws/transcribe") as ws:
+    async with websockets.connect("ws://localhost:8123/ws/transcribe") as ws:
         chunk_size = 4096
         for i in range(0, len(pcm16), chunk_size):
             await ws.send(pcm16[i : i + chunk_size])

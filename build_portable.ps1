@@ -6,12 +6,21 @@ Python already present on the target machine), bootstraps pip into it, installs 
 deps, downloads and converts the model weights, downloads a static ffmpeg build, and
 writes out the app code (embedded in this script -- no repo checkout needed).
 
-The app runs on faster-whisper (CTranslate2), not PyTorch, so the runtime footprint
-is small (~200-300MB for the Python/deps, no multi-GB torch install) and the model
-ships int8-quantized (~240MB instead of ~460MB+ fp16/fp32). GPU acceleration works
-automatically at runtime if the target machine has a compatible NVIDIA driver and
-CUDA/cuDNN available (see the GPU note in README.md) -- no separate build flag needed,
-unlike the old torch-based build.
+The app runs on faster-whisper (CTranslate2), not PyTorch, so inference itself never
+touches torch and the model ships int8-quantized (~240MB for small, instead of
+~460MB+ fp16/fp32).
+
+The output is CPU-only by default and both halves of that are reversible on the
+target machine, without rebuilding:
+
+  * enable_gpu.bat  -- downloads the CUDA runtime DLLs CTranslate2 needs (cuBLAS +
+    cuDNN 9, ~1.5GB) into cuda\, after which DEVICE=auto picks up the GPU. Only the
+    NVIDIA driver is required there, no CUDA toolkit. Pass -IncludeCuda at build time
+    to bundle them up front instead (e.g. when the target machine has no internet).
+  * switch_model.bat medium  -- re-downloads and re-converts to another PhoWhisper
+    checkpoint (tiny/base/small/medium/large, or any HF repo id). This is why CPU
+    torch + transformers stay installed in the output (~1GB): they are the converter.
+    Pass -StripTorch to remove them for a smaller, fixed-model package.
 
 This script is fully self-contained: copy just this one file to the target machine
 and run it there, or run it on a dev machine and copy the resulting output folder.
@@ -19,11 +28,10 @@ and run it there, or run it on a dev machine and copy the resulting output folde
 Usage:
     .\build_portable.ps1
     .\build_portable.ps1 -OutDir C:\deploy\vietnamese-stt-server
+    .\build_portable.ps1 -Model medium -IncludeCuda
 
 Requires: internet access on the machine running this script (to fetch the embeddable
-Python, pip, ffmpeg, and the model weights from Hugging Face). Model conversion
-temporarily installs CPU torch + transformers to do the one-time CTranslate2
-conversion, then uninstalls them -- they are not part of the shipped output.
+Python, pip, ffmpeg, and the model weights from Hugging Face).
 #>
 
 param(
@@ -31,7 +39,18 @@ param(
     [string]$PythonVersion = "3.13.12",
     # BtbN/FFmpeg-Builds release asset, pinned to the n8.1 release build (static, GPL),
     # not the rolling nightly "master" build, so the ffmpeg version stays predictable.
-    [string]$FfmpegAssetUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip"
+    [string]$FfmpegAssetUrl = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip",
+    # Checkpoint to ship. A PhoWhisper size shortcut (tiny/base/small/medium/large)
+    # or any Hugging Face repo id. Changeable after the build with switch_model.bat.
+    [string]$Model = "small",
+    # Bundle the CUDA runtime DLLs (cuBLAS + cuDNN, ~1.5GB) into cuda\ at build time.
+    # Off by default: the output is CPU-only, and enable_gpu.bat fetches them on the
+    # target machine instead. Use this when that machine has no internet access.
+    [switch]$IncludeCuda,
+    # Uninstall torch/transformers after the model conversion, for a ~1GB smaller
+    # output. Trade-off: switch_model.bat can no longer convert a different
+    # checkpoint, so the shipped model becomes fixed.
+    [switch]$StripTorch
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,9 +65,19 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# The portable Windows build ships the CUDA DLLs that CTranslate2 needs (cuBLAS, and
+# the cuDNN 9 sublibraries) in a "cuda" folder next to the app. They are loaded
+# lazily by name at first inference, so the folder has to be on the DLL search path
+# before then -- register it here rather than relying on the launcher's PATH.
+CUDA_DLL_DIR = Path(os.environ.get("CUDA_DLL_DIR") or Path(__file__).parent / "cuda")
+if sys.platform == "win32" and CUDA_DLL_DIR.is_dir():
+    os.add_dll_directory(str(CUDA_DLL_DIR))
+    os.environ["PATH"] = str(CUDA_DLL_DIR) + os.pathsep + os.environ.get("PATH", "")
 
 import ctranslate2
 import numpy as np
@@ -57,7 +86,7 @@ from faster_whisper import WhisperModel
 from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
-from download_model import REPO_ID
+from download_model import current_repo_id
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "models-ct2")
 SAMPLE_RATE = 16000
@@ -261,7 +290,7 @@ async def transcribe_stream(websocket: WebSocket):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "device": device, "model": REPO_ID}
+    return {"status": "ok", "device": device, "model": current_repo_id()}
 
 
 if __name__ == "__main__":
@@ -276,7 +305,7 @@ if __name__ == "__main__":
         help="Force cuda/cpu, or auto-detect (default; same as $DEVICE)",
     )
     parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8123")))
     args = parser.parse_args()
 
     if args.device:
@@ -286,23 +315,71 @@ if __name__ == "__main__":
 '@
 
 $DownloadModelPy = @'
-"""Fetch PhoWhisper-small's raw HF files (config, tokenizer, and weights) into models/.
+"""Fetch a PhoWhisper checkpoint's raw HF files (config, tokenizer, weights) into models/.
+
+Which checkpoint gets fetched is not hardcoded: it comes from $MODEL_REPO, else from
+model_id.txt (written by switch_model.py), else the default below -- so an already
+built install can be moved between small/medium without editing any source.
 
 This is a staging download only -- the app itself runs on the CTranslate2 format
 produced by convert_ct2.py from these files, not on this directory directly.
 """
+import os
+import sys
+from pathlib import Path
+
 from huggingface_hub import snapshot_download
 
-REPO_ID = "vinai/PhoWhisper-small"
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_REPO_ID = "vinai/PhoWhisper-small"
+MODEL_ID_FILE = BASE_DIR / "model_id.txt"
+
+# Short names so callers can say "medium" instead of the full repo path. Any other
+# value is passed through to Hugging Face as-is.
+ALIASES = {
+    "tiny": "vinai/PhoWhisper-tiny",
+    "base": "vinai/PhoWhisper-base",
+    "small": "vinai/PhoWhisper-small",
+    "medium": "vinai/PhoWhisper-medium",
+    "large": "vinai/PhoWhisper-large",
+}
+
+# Weights only in .bin form: the *.safetensors siblings would double the download.
+ALLOW_PATTERNS = ["*.json", "*.txt", "vocab.*", "merges.txt", "*.model", "pytorch_model.bin"]
+
+
+def resolve_repo_id(name: str) -> str:
+    name = (name or "").strip()
+    return ALIASES.get(name.lower(), name)
+
+
+def current_repo_id() -> str:
+    """The checkpoint this install is currently set to serve."""
+    env = resolve_repo_id(os.environ.get("MODEL_REPO", ""))
+    if env:
+        return env
+    try:
+        recorded = resolve_repo_id(MODEL_ID_FILE.read_text(encoding="utf-8"))
+    except OSError:
+        recorded = ""
+    return recorded or DEFAULT_REPO_ID
+
+
+def download(repo_id: str | None = None) -> str:
+    repo_id = resolve_repo_id(repo_id) if repo_id else current_repo_id()
+    snapshot_download(
+        repo_id=repo_id,
+        local_dir=str(BASE_DIR / "models"),
+        allow_patterns=ALLOW_PATTERNS,
+    )
+    return repo_id
+
+
+REPO_ID = current_repo_id()
 
 if __name__ == "__main__":
-    snapshot_download(
-        repo_id=REPO_ID,
-        local_dir="models",
-        allow_patterns=["*.json", "*.txt", "vocab.*", "merges.txt", "*.model", "pytorch_model.bin"],
-    )
-
-    print("Done. Model files are now in models/. Run convert_ct2.py next.")
+    fetched = download(sys.argv[1] if len(sys.argv) > 1 else None)
+    print(f"Done. {fetched} files are now in models/. Run convert_ct2.py next.")
 '@
 
 $ConvertCt2Py = @'
@@ -310,11 +387,19 @@ $ConvertCt2Py = @'
 CTranslate2 format in models-ct2/, quantized to int8. This is what main.py actually
 loads at runtime via faster-whisper.
 
-Requires transformers and torch installed -- only for this one-time conversion, not
-at runtime.
+Requires transformers and torch installed -- only for this conversion, not at
+runtime. The portable build keeps them installed so switch_model.py can re-run this
+against a different checkpoint later; uninstall them for a slimmer environment if you
+never intend to switch models.
 """
+from pathlib import Path
+
 from ctranslate2.converters import TransformersConverter
 
+BASE_DIR = Path(__file__).resolve().parent
+
+# Auxiliary files the HF repo doesn't put in a single weights blob: tokenizer,
+# generation defaults, and PhoWhisper's Vietnamese text normalizer.
 COPY_FILES = [
     "tokenizer.json",
     "preprocessor_config.json",
@@ -326,11 +411,142 @@ COPY_FILES = [
     "generation_config.json",
 ]
 
-if __name__ == "__main__":
-    converter = TransformersConverter("models", copy_files=COPY_FILES)
-    converter.convert("models-ct2", quantization="int8", force=True)
 
-    print("Done. CTranslate2 model is now in models-ct2/")
+def convert(model_dir: str | Path | None = None, out_dir: str | Path | None = None) -> Path:
+    model_dir = Path(model_dir) if model_dir else BASE_DIR / "models"
+    out_dir = Path(out_dir) if out_dir else BASE_DIR / "models-ct2"
+    converter = TransformersConverter(str(model_dir), copy_files=COPY_FILES)
+    converter.convert(str(out_dir), quantization="int8", force=True)
+    return out_dir
+
+
+if __name__ == "__main__":
+    print(f"Done. CTranslate2 model is now in {convert()}")
+'@
+
+$SwitchModelPy = @'
+"""Switch which PhoWhisper checkpoint this install serves, e.g. small <-> medium.
+
+    python switch_model.py medium
+    python switch_model.py vinai/PhoWhisper-large
+
+Downloads the raw HF weights, re-converts them to CTranslate2 int8 in models-ct2/,
+and records the choice in model_id.txt so main.py reports it and later runs of
+download_model.py stay on it. Restart the server afterwards to load the new model.
+
+Needs torch + transformers installed (the portable build ships them for exactly
+this); the conversion is CPU-only and does not need a GPU.
+"""
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+import convert_ct2
+import download_model
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "model",
+        nargs="?",
+        help=f"Checkpoint to switch to: {', '.join(download_model.ALIASES)}, or any HF repo id",
+    )
+    parser.add_argument(
+        "--keep-raw",
+        action="store_true",
+        help="Keep the downloaded HF weights in models/ instead of deleting them after conversion",
+    )
+    args = parser.parse_args()
+
+    if not args.model:
+        print(f"Current model: {download_model.current_repo_id()}")
+        print(f"Available shortcuts: {', '.join(download_model.ALIASES)}")
+        return 0
+
+    repo_id = download_model.resolve_repo_id(args.model)
+    print(f"Switching to {repo_id} ...")
+
+    try:
+        download_model.download(repo_id)
+    except Exception as exc:
+        # A typo'd repo id fails here, before models-ct2/ is touched, so the currently
+        # working model is left intact.
+        print(f"Download failed ({exc}). Model unchanged.", file=sys.stderr)
+        return 1
+
+    print("Converting to CTranslate2 int8 ...")
+    convert_ct2.convert()
+
+    (BASE_DIR / "model_id.txt").write_text(repo_id + "\n", encoding="utf-8")
+
+    if not args.keep_raw:
+        shutil.rmtree(BASE_DIR / "models", ignore_errors=True)
+
+    print(f"Done. Now serving {repo_id}. Restart the server to load it.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'@
+
+$EnableGpuPy = @'
+"""Download the CUDA runtime DLLs CTranslate2 needs for GPU mode into the cuda folder.
+
+Portable builds are CPU-only by default; run this once, on a machine with an NVIDIA
+GPU and internet access, to add GPU support (~1.5GB). Only the NVIDIA driver has to
+be installed there -- these wheels carry the whole CUDA 12 / cuDNN 9 runtime, so no
+CUDA toolkit is needed. Afterwards set DEVICE=auto (or cuda) in config.ini and
+restart run.bat.
+"""
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+CUDA_DIR = BASE_DIR / "cuda"
+# Installed with --target into a scratch dir rather than into the embedded Python, so
+# the wheels stay out of pip's package list and only the DLLs are kept.
+STAGING_DIR = BASE_DIR / ".cuda-wheels"
+PACKAGES = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]
+
+if __name__ == "__main__":
+    shutil.rmtree(STAGING_DIR, ignore_errors=True)
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+             "--target", str(STAGING_DIR), *PACKAGES]
+        )
+        CUDA_DIR.mkdir(exist_ok=True)
+        copied = 0
+        for dll in STAGING_DIR.rglob("*.dll"):
+            shutil.copy2(dll, CUDA_DIR / dll.name)
+            copied += 1
+    finally:
+        shutil.rmtree(STAGING_DIR, ignore_errors=True)
+
+    total_mb = sum(f.stat().st_size for f in CUDA_DIR.glob("*.dll")) / (1024 * 1024)
+    print(f"Copied {copied} DLLs into {CUDA_DIR} ({total_mb:,.0f} MB total).")
+    print("Set DEVICE=auto (or cuda) in config.ini, then restart run.bat.")
+'@
+
+$SwitchModelBat = @'
+@echo off
+setlocal
+cd /d "%~dp0"
+"%~dp0python\python.exe" switch_model.py %*
+'@
+
+$EnableGpuBat = @'
+@echo off
+setlocal
+cd /d "%~dp0"
+"%~dp0python\python.exe" enable_gpu.py
 '@
 
 $RequirementsTxt = @'
@@ -568,6 +784,14 @@ Write-Host "Writing app source..."
 Set-Content -Path (Join-Path $OutDir "main.py") -Value $MainPy -Encoding UTF8
 Set-Content -Path (Join-Path $OutDir "download_model.py") -Value $DownloadModelPy -Encoding UTF8
 Set-Content -Path (Join-Path $OutDir "convert_ct2.py") -Value $ConvertCt2Py -Encoding UTF8
+Set-Content -Path (Join-Path $OutDir "switch_model.py") -Value $SwitchModelPy -Encoding UTF8
+Set-Content -Path (Join-Path $OutDir "enable_gpu.py") -Value $EnableGpuPy -Encoding UTF8
+Set-Content -Path (Join-Path $OutDir "switch_model.bat") -Value $SwitchModelBat -Encoding ASCII
+Set-Content -Path (Join-Path $OutDir "enable_gpu.bat") -Value $EnableGpuBat -Encoding ASCII
+# The checkpoint the app serves, read back by download_model.current_repo_id() and
+# rewritten by switch_model.py. Size shortcuts ("medium") resolve the same as full
+# repo ids, so $Model can be stored verbatim.
+Set-Content -Path (Join-Path $OutDir "model_id.txt") -Value $Model -Encoding ASCII
 New-Item -ItemType Directory -Force -Path (Join-Path $OutDir "static") | Out-Null
 Set-Content -Path (Join-Path $OutDir "static\index.html") -Value $IndexHtml -Encoding UTF8
 $RequirementsPath = Join-Path $OutDir "requirements.txt"
@@ -600,13 +824,23 @@ Remove-Item $GetPipPath
 Write-Host "Installing requirements (faster-whisper, fastapi, etc.)..."
 & $PyExe -m pip install --no-cache-dir -r $RequirementsPath
 
-# Snapshot installed packages now, so the conversion-only torch/transformers install
-# below (and their transitive deps, e.g. sympy/networkx/mpmath) can be fully removed
-# afterward by diffing against this baseline -- `pip uninstall torch transformers`
-# alone leaves their dependencies behind as dead weight.
-$BaselinePackages = (& $PyExe -m pip freeze) | ForEach-Object { ($_ -split "==")[0].ToLower() }
+# torch + transformers are the model converter: CTranslate2 reads the Hugging Face
+# checkpoint through them. CPU torch is all that is needed even for a GPU deployment
+# -- it only reads the weights, it never runs them -- and they stay installed in the
+# output so switch_model.bat can convert a different checkpoint on the target machine
+# later. -StripTorch removes them again for a smaller, fixed-model package.
+if ($StripTorch) {
+    # Snapshot installed packages first, so torch/transformers' transitive deps (e.g.
+    # sympy/networkx/mpmath) can be removed too by diffing against this baseline --
+    # `pip uninstall torch transformers` alone leaves them behind as dead weight.
+    $BaselinePackages = (& $PyExe -m pip freeze) | ForEach-Object { ($_ -split "==")[0].ToLower() }
+}
 
-Write-Host "Downloading model weights..."
+Write-Host "Installing the model converter (CPU torch + transformers)..."
+& $PyExe -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+& $PyExe -m pip install --no-cache-dir transformers
+
+Write-Host "Downloading model weights ($Model)..."
 Push-Location $OutDir
 try {
     & $PyExe download_model.py
@@ -614,15 +848,8 @@ try {
     Pop-Location
 }
 
-# Convert to CTranslate2 int8 format (~240MB, vs ~923MB for the raw fp32 weights).
-# This needs transformers+torch temporarily to load the HF checkpoint -- installed
-# here, then uninstalled once the conversion is done so they aren't part of the
-# shipped output. CPU torch is fine even for a GPU deployment: it's only used to
-# read the weights, not to run them.
-Write-Host "Installing transformers+torch temporarily for model conversion..."
-& $PyExe -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-& $PyExe -m pip install --no-cache-dir transformers
-
+# Convert to CTranslate2 int8 format (~240MB for small, vs ~923MB for the raw fp32
+# weights).
 Write-Host "Converting model weights to CTranslate2 int8 format..."
 Push-Location $OutDir
 try {
@@ -631,17 +858,22 @@ try {
     Pop-Location
 }
 
-Write-Host "Removing conversion-only packages (torch, transformers, and their deps)..."
-& $PyExe -m pip uninstall -y torch transformers
-$CurrentPackages = (& $PyExe -m pip freeze) | ForEach-Object { ($_ -split "==")[0] }
-$Orphans = $CurrentPackages | Where-Object { $BaselinePackages -notcontains $_.ToLower() }
-if ($Orphans) {
-    Write-Host "Also removing leftover transitive deps: $($Orphans -join ', ')"
-    & $PyExe -m pip uninstall -y @Orphans
+if ($StripTorch) {
+    Write-Host "Removing conversion-only packages (torch, transformers, and their deps)..."
+    & $PyExe -m pip uninstall -y torch transformers
+    $CurrentPackages = (& $PyExe -m pip freeze) | ForEach-Object { ($_ -split "==")[0] }
+    $Orphans = $CurrentPackages | Where-Object { $BaselinePackages -notcontains $_.ToLower() }
+    if ($Orphans) {
+        Write-Host "Also removing leftover transitive deps: $($Orphans -join ', ')"
+        & $PyExe -m pip uninstall -y @Orphans
+    }
+    Remove-Item (Join-Path $OutDir "switch_model.py") -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $OutDir "switch_model.bat") -ErrorAction SilentlyContinue
+    Remove-Item (Join-Path $OutDir "convert_ct2.py") -ErrorAction SilentlyContinue
 }
 
+# The raw HF weights are only converter input; models-ct2\ is what the app loads.
 Remove-Item (Join-Path $OutDir "models") -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $OutDir "convert_ct2.py") -ErrorAction SilentlyContinue
 
 Write-Host "Downloading static ffmpeg build..."
 $BinDir = Join-Path $OutDir "bin"
@@ -659,15 +891,40 @@ Copy-Item $FfmpegExe.FullName (Join-Path $BinDir "ffmpeg.exe")
 Remove-Item $FfmpegZipPath
 Remove-Item -Recurse -Force $FfmpegExtractDir
 
+if (-not $IncludeCuda) {
+    Write-Host "Skipping the CUDA runtime bundle; this build is CPU-only."
+    Write-Host "Run enable_gpu.bat on the target machine to add GPU support later."
+} else {
+    # The ctranslate2 wheel ships ctranslate2.dll and cudnn64_9.dll, but none of the
+    # CUDA libraries those load by name at first inference (cublas64_12.dll, the cuDNN
+    # 9 sublibraries) -- so GPU mode dies with "Library cublas64_12.dll is not found"
+    # on a machine with no CUDA toolkit installed. Ship them alongside the app.
+    # Installed with --target into a temp dir rather than into the embedded Python, so
+    # they stay out of pip's package list and only the DLLs land in the output. This
+    # is the build-time twin of enable_gpu.py, for targets with no internet access.
+    Write-Host "Downloading CUDA runtime DLLs (cuBLAS + cuDNN) for GPU support..."
+    $CudaDir = Join-Path $OutDir "cuda"
+    New-Item -ItemType Directory -Force -Path $CudaDir | Out-Null
+    $NvidiaTmp = Join-Path $env:TEMP "vstt-nvidia-wheels"
+    if (Test-Path $NvidiaTmp) { Remove-Item -Recurse -Force $NvidiaTmp }
+    & $PyExe -m pip install --no-cache-dir --target $NvidiaTmp nvidia-cublas-cu12 nvidia-cudnn-cu12
+    Get-ChildItem -Path $NvidiaTmp -Recurse -Filter "*.dll" |
+        ForEach-Object { Copy-Item $_.FullName (Join-Path $CudaDir $_.Name) -Force }
+    Remove-Item -Recurse -Force $NvidiaTmp
+    $CudaSize = (Get-ChildItem $CudaDir | Measure-Object -Property Length -Sum).Sum / 1MB
+    Write-Host ("Bundled CUDA runtime: {0:N0} MB in cuda\" -f $CudaSize)
+}
+
 $ConfigIni = @'
 ; Edit these values, then restart run.bat to apply them.
 HOST=0.0.0.0
-PORT=8000
+PORT=8123
 
 ; Force "cuda" or "cpu", or leave as "auto" to use CUDA when available. GPU mode
-; requires a compatible NVIDIA driver plus CUDA/cuDNN available on this machine --
-; the shipped build itself has no CUDA runtime bundled (unlike the old torch build),
-; so this only works if the target machine already has them installed.
+; needs an NVIDIA driver new enough for CUDA 12, plus the cuBLAS/cuDNN runtime in the
+; cuda\ folder -- if that folder is missing or empty, this package was built CPU-only:
+; run enable_gpu.bat once (needs internet) to download it. No CUDA toolkit install is
+; required on this machine either way.
 DEVICE=auto
 
 ; On a multi-GPU machine, pin to one GPU (e.g. "0" or "1") to avoid contention with
@@ -686,6 +943,7 @@ for /f "usebackq eol=; tokens=1,2 delims==" %%A in ("config.ini") do (
 title Vietnamese STT Server (port %PORT%)
 set MODEL_DIR=%~dp0models-ct2
 set FFMPEG_BIN=%~dp0bin\ffmpeg.exe
+set PATH=%~dp0cuda;%PATH%
 "%~dp0python\python.exe" -m uvicorn main:app --host %HOST% --port %PORT%
 '@
 Set-Content -Path (Join-Path $OutDir "run.bat") -Value $RunBat -Encoding ASCII
@@ -695,3 +953,10 @@ Write-Host "Done. Portable app built at: $OutDir"
 Write-Host ""
 Write-Host "Run 'run.bat' from that folder to start the server, or zip the whole"
 Write-Host "folder and copy it to another machine (no internet needed there)."
+Write-Host ""
+if (-not $IncludeCuda) {
+    Write-Host "GPU support:   enable_gpu.bat        (downloads ~1.5GB of CUDA DLLs)"
+}
+if (-not $StripTorch) {
+    Write-Host "Change model:  switch_model.bat medium   (currently: $Model)"
+}
