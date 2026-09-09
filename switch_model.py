@@ -15,10 +15,16 @@ import shutil
 import sys
 from pathlib import Path
 
-import convert_ct2
-import download_model
-
 BASE_DIR = Path(__file__).resolve().parent
+
+# The portable build runs an embeddable Python, whose python3xx._pth puts the
+# interpreter in isolated mode: sys.path comes only from that file, and the script's
+# own directory is NOT added. Put it back before importing the sibling modules.
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+import convert_ct2  # noqa: E402
+import download_model  # noqa: E402
 
 
 def main() -> int:

@@ -442,10 +442,16 @@ import shutil
 import sys
 from pathlib import Path
 
-import convert_ct2
-import download_model
-
 BASE_DIR = Path(__file__).resolve().parent
+
+# The portable build runs an embeddable Python, whose python3xx._pth puts the
+# interpreter in isolated mode: sys.path comes only from that file, and the script's
+# own directory is NOT added. Put it back before importing the sibling modules.
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+import convert_ct2  # noqa: E402
+import download_model  # noqa: E402
 
 
 def main() -> int:
@@ -812,8 +818,13 @@ $VerTag = ($PythonVersion.Split(".")[0..1] -join "")  # e.g. "313"
 
 # Embeddable distributions ship with site-packages imports disabled and no pip.
 # Uncomment "import site" in the ._pth file so installed packages are importable.
+# The ._pth also puts Python in isolated mode -- sys.path is exactly what this file
+# lists, and a script's own directory is not added -- so append ".." (resolved
+# relative to the ._pth, i.e. the app folder) to make main.py / download_model.py /
+# convert_ct2.py importable from any working directory.
 $PthFile = Join-Path $PyDir "python$VerTag._pth"
 (Get-Content $PthFile) -replace '^#import site$', 'import site' | Set-Content $PthFile
+Add-Content -Path $PthFile -Value ".."
 
 Write-Host "Bootstrapping pip..."
 $GetPipPath = Join-Path $env:TEMP "get-pip.py"
