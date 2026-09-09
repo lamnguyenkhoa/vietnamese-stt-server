@@ -7,41 +7,46 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import paths
+
 # The portable Windows build ships the CUDA DLLs that CTranslate2 needs (cuBLAS, and
-# the cuDNN 9 sublibraries) in a "cuda" folder next to the app. They are loaded
+# the cuDNN 9 sublibraries) in a "cuda" folder in the app root. They are loaded
 # lazily by name at first inference, so the folder has to be on the DLL search path
 # before then -- register it here rather than relying on the launcher's PATH.
-CUDA_DLL_DIR = Path(os.environ.get("CUDA_DLL_DIR") or Path(__file__).parent / "cuda")
-if sys.platform == "win32" and CUDA_DLL_DIR.is_dir():
-    os.add_dll_directory(str(CUDA_DLL_DIR))
-    os.environ["PATH"] = str(CUDA_DLL_DIR) + os.pathsep + os.environ.get("PATH", "")
+CUDA_DLL_DIR = Path(os.environ.get("CUDA_DLL_DIR") or paths.CUDA_DIR)
+if CUDA_DLL_DIR.is_dir():
+    if sys.platform == "win32":
+        os.add_dll_directory(str(CUDA_DLL_DIR))
+        os.environ["PATH"] = str(CUDA_DLL_DIR) + os.pathsep + os.environ.get("PATH", "")
+    else:
+        # glibc's dynamic linker re-reads LD_LIBRARY_PATH on every dlopen(), not just
+        # at process start, so setting it here (before ctranslate2 is imported and
+        # dlopen's cuBLAS/cuDNN by name) still takes effect -- same trick the nvidia-*
+        # wheels' own loaders use.
+        os.environ["LD_LIBRARY_PATH"] = (
+            str(CUDA_DLL_DIR) + os.pathsep + os.environ.get("LD_LIBRARY_PATH", "")
+        )
 
 import ctranslate2
 import numpy as np
 import soundfile as sf
 from faster_whisper import WhisperModel
-from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 
 from download_model import current_repo_id
 
-MODEL_DIR = os.environ.get("MODEL_DIR", "models-ct2")
+MODEL_DIR = os.environ.get("MODEL_DIR") or str(paths.MODEL_CT2_DIR)
 SAMPLE_RATE = 16000
-STREAM_CHUNK_SECONDS = 3.0
-SILENCE_RMS_THRESHOLD = 0.01
-AUTO_STOP_SILENCE_SECONDS = float(os.environ.get("AUTO_STOP_SILENCE_SECONDS", "2.0"))
 
 # Resolve ffmpeg: explicit override, then PATH, then a copy bundled alongside the app
 # (used by the portable Windows package, which ships its own ffmpeg.exe).
 FFMPEG_BIN = (
     os.environ.get("FFMPEG_BIN")
     or shutil.which("ffmpeg")
-    or str(Path(__file__).parent / "bin" / "ffmpeg.exe")
+    or str(paths.BIN_DIR / ("ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"))
 )
 
-
-def is_silent(audio: "np.ndarray") -> bool:
-    return float(np.sqrt(np.mean(np.square(audio)))) < SILENCE_RMS_THRESHOLD
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -110,7 +115,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=str(paths.STATIC_DIR)), name="static")
 
 
 def load_audio(raw_bytes: bytes) -> "list[float]":
@@ -163,66 +168,6 @@ async def transcribe(file: UploadFile):
     raw_bytes = await file.read()
     audio = load_audio(raw_bytes)
     return {"text": transcribe_array(audio)}
-
-
-@app.websocket("/ws/transcribe")
-async def transcribe_stream(websocket: WebSocket):
-    """Stream raw PCM16LE mono 16kHz audio; receive partial transcripts as it arrives.
-
-    Send a text message "end" (or just close the socket) to flush the final chunk.
-    """
-    await websocket.accept()
-    chunk_samples = int(STREAM_CHUNK_SECONDS * SAMPLE_RATE)
-    buffer = np.empty(0, dtype=np.float32)
-    speech_detected = False
-    silence_seconds = 0.0
-
-    try:
-        while True:
-            message = await websocket.receive()
-            if message["type"] == "websocket.disconnect":
-                return
-
-            if "bytes" in message and message["bytes"] is not None:
-                pcm16 = np.frombuffer(message["bytes"], dtype=np.int16)
-                chunk = pcm16.astype(np.float32) / 32768.0
-                buffer = np.concatenate([buffer, chunk])
-
-                if len(chunk) > 0:
-                    if is_silent(chunk):
-                        if speech_detected:
-                            silence_seconds += len(chunk) / SAMPLE_RATE
-                    else:
-                        speech_detected = True
-                        silence_seconds = 0.0
-
-                if len(buffer) >= chunk_samples:
-                    if is_silent(buffer):
-                        text = ""
-                    else:
-                        text = transcribe_array(buffer)
-                    buffer = np.empty(0, dtype=np.float32)
-                    if text:
-                        await websocket.send_json({"text": text, "final": False})
-
-                if speech_detected and silence_seconds >= AUTO_STOP_SILENCE_SECONDS:
-                    if len(buffer) > 0 and not is_silent(buffer):
-                        text = transcribe_array(buffer)
-                        if text:
-                            await websocket.send_json({"text": text, "final": True})
-                    await websocket.send_json({"event": "auto_stop"})
-                    await websocket.close()
-                    return
-
-            elif message.get("text") == "end":
-                if len(buffer) > 0 and not is_silent(buffer):
-                    text = transcribe_array(buffer)
-                    if text:
-                        await websocket.send_json({"text": text, "final": True})
-                await websocket.close()
-                return
-    except WebSocketDisconnect:
-        return
 
 
 @app.get("/health")

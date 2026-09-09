@@ -13,9 +13,10 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_REPO_ID = "vinai/PhoWhisper-small"
-MODEL_ID_FILE = BASE_DIR / "model_id.txt"
+import paths
+
+DEFAULT_REPO_ID = "vinai/PhoWhisper-medium"
+MODEL_ID_FILE = paths.MODEL_ID_FILE
 
 # Short names so callers can say "medium" instead of the full repo path. Any other
 # value is passed through to Hugging Face as-is.
@@ -52,7 +53,7 @@ def download(repo_id: str | None = None) -> str:
     repo_id = resolve_repo_id(repo_id) if repo_id else current_repo_id()
     snapshot_download(
         repo_id=repo_id,
-        local_dir=str(BASE_DIR / "models"),
+        local_dir=str(paths.MODELS_DIR),
         allow_patterns=ALLOW_PATTERNS,
     )
     return repo_id

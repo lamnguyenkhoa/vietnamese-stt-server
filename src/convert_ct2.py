@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ctranslate2.converters import TransformersConverter
 
-BASE_DIR = Path(__file__).resolve().parent
+import paths
 
 # Auxiliary files the HF repo doesn't put in a single weights blob: tokenizer,
 # generation defaults, and PhoWhisper's Vietnamese text normalizer.
@@ -28,8 +28,8 @@ COPY_FILES = [
 
 
 def convert(model_dir: str | Path | None = None, out_dir: str | Path | None = None) -> Path:
-    model_dir = Path(model_dir) if model_dir else BASE_DIR / "models"
-    out_dir = Path(out_dir) if out_dir else BASE_DIR / "models-ct2"
+    model_dir = Path(model_dir) if model_dir else paths.MODELS_DIR
+    out_dir = Path(out_dir) if out_dir else paths.MODEL_CT2_DIR
     converter = TransformersConverter(str(model_dir), copy_files=COPY_FILES)
     converter.convert(str(out_dir), quantization="int8", force=True)
     return out_dir

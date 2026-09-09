@@ -6,7 +6,8 @@ already on this machine instead of from the internet:
     of requirements.txt -- torch/transformers and other dev-only extras are skipped)
   * the model ships from the local models-ct2\ folder (no Hugging Face download,
     no re-conversion)
-  * app code is copied from the repo working tree, not from an embedded copy
+  * app code is copied from the repo working tree (src\ modules), not from an
+    embedded copy
   * ffmpeg.exe is taken from PATH (or -FfmpegExe)
 
 The one piece that cannot come from the working tree is the Python embeddable
@@ -43,7 +44,7 @@ if (-not (Test-Path $VenvPython)) {
     Write-Error "venv python not found at '$VenvPython'. Create the venv and 'pip install -r requirements.txt' first."
 }
 if (-not (Test-Path (Join-Path $ModelDir "model.bin"))) {
-    Write-Error "No converted model at '$ModelDir\model.bin'. Run download_model.py then convert_ct2.py first (or use build_portable.ps1, which does both)."
+    Write-Error "No converted model at '$ModelDir\model.bin'. Run src\download_model.py then src\convert_ct2.py first (or use build_portable.ps1, which does both)."
 }
 
 if (-not $PythonVersion) {
@@ -63,7 +64,12 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path
 
 Write-Host "Copying app source from working tree..."
-Copy-Item "main.py", "download_model.py", "requirements.txt" $OutDir
+Copy-Item "requirements.txt" $OutDir
+# Only the runtime modules: this build ships no torch, so the conversion tools
+# (convert_ct2 / switch_model) would not work in it anyway.
+$SrcDir = Join-Path $OutDir "src"
+New-Item -ItemType Directory -Force -Path $SrcDir | Out-Null
+Copy-Item "src\paths.py", "src\main.py", "src\download_model.py" $SrcDir
 # Records which checkpoint the app serves; absent until switch_model.py writes it,
 # in which case download_model.py falls back to its default.
 if (Test-Path "model_id.txt") { Copy-Item "model_id.txt" $OutDir }
@@ -94,6 +100,9 @@ $PyExe = Join-Path $PyDir "python.exe"
 $PthFile = Join-Path $PyDir "python$VerTag._pth"
 $Pth = (Get-Content $PthFile) -replace '^#import site$', 'import site'
 if ($Pth -notcontains 'Lib\site-packages') { $Pth += 'Lib\site-packages' }
+# The app modules live in src\, one level above python\ -- ._pth entries resolve
+# relative to this file, so this is the app's src folder.
+if ($Pth -notcontains '..\src') { $Pth += '..\src' }
 Set-Content -Path $PthFile -Value $Pth -Encoding ASCII
 
 # ctranslate2/onnxruntime need the MSVC runtime; the embeddable zip ships vcruntime140.dll
@@ -108,7 +117,7 @@ if ((-not (Test-Path (Join-Path $PyDir "vcruntime140_1.dll"))) -and (Test-Path $
 # ---------------------------------------------------------------------------
 
 Write-Host "Copying dependency closure from $VenvPython ..."
-& $VenvPython collect_deps.py requirements.txt (Join-Path $PyDir "Lib\site-packages")
+& $VenvPython (Join-Path "src" "collect_deps.py") requirements.txt (Join-Path $PyDir "Lib\site-packages")
 if ($LASTEXITCODE -ne 0) { Write-Error "Dependency collection failed." }
 
 # ---------------------------------------------------------------------------
@@ -160,7 +169,7 @@ for /f "usebackq eol=; tokens=1,2 delims==" %%A in ("config.ini") do (
 title Vietnamese STT Server (port %PORT%)
 set MODEL_DIR=%~dp0models-ct2
 set FFMPEG_BIN=%~dp0bin\ffmpeg.exe
-"%~dp0python\python.exe" -m uvicorn main:app --host %HOST% --port %PORT%
+"%~dp0python\python.exe" -m uvicorn main:app --app-dir "%~dp0src" --host %HOST% --port %PORT%
 '@
 Set-Content -Path (Join-Path $OutDir "run.bat") -Value $RunBat -Encoding ASCII
 

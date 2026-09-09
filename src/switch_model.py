@@ -15,16 +15,17 @@ import shutil
 import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+SRC_DIR = Path(__file__).resolve().parent
 
 # The portable build runs an embeddable Python, whose python3xx._pth puts the
 # interpreter in isolated mode: sys.path comes only from that file, and the script's
 # own directory is NOT added. Put it back before importing the sibling modules.
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 import convert_ct2  # noqa: E402
 import download_model  # noqa: E402
+import paths  # noqa: E402
 
 
 def main() -> int:
@@ -60,10 +61,10 @@ def main() -> int:
     print("Converting to CTranslate2 int8 ...")
     convert_ct2.convert()
 
-    (BASE_DIR / "model_id.txt").write_text(repo_id + "\n", encoding="utf-8")
+    paths.MODEL_ID_FILE.write_text(repo_id + "\n", encoding="utf-8")
 
     if not args.keep_raw:
-        shutil.rmtree(BASE_DIR / "models", ignore_errors=True)
+        shutil.rmtree(paths.MODELS_DIR, ignore_errors=True)
 
     print(f"Done. Now serving {repo_id}. Restart the server to load it.")
     return 0

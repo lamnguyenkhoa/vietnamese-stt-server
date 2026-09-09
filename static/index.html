@@ -2,21 +2,21 @@
 <html lang="vi">
 <head>
 <meta charset="utf-8" />
-<title>PhoWhisper Streaming Test</title>
+<title>PhoWhisper Transcribe Test</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
   button { font-size: 16px; padding: 8px 20px; margin-right: 8px; }
   #status { color: #666; margin: 12px 0; }
   #transcript { border: 1px solid #ccc; border-radius: 6px; padding: 12px; min-height: 120px; white-space: pre-wrap; }
-  .partial { color: #999; }
 </style>
 </head>
 <body>
-  <h1>PhoWhisper Streaming Test</h1>
-  <button id="start">Start</button>
-  <button id="stop" disabled>Stop</button>
-  <div id="status">idle</div>
-  <div id="transcript"></div>
+<h1>PhoWhisper Transcribe Test</h1>
+<p>Records locally; transcribes once (via POST /transcribe) only after you stop — either by clicking Stop or after silence auto-stops it.</p>
+<button id="start">Start</button>
+<button id="stop" disabled>Stop</button>
+<div id="status">idle</div>
+<div id="transcript"></div>
 
 <script>
 const startBtn = document.getElementById("start");
@@ -24,104 +24,12 @@ const stopBtn = document.getElementById("stop");
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 
-let ws, audioCtx, source, processor, stream;
-let finalText = "";
-
-function floatTo16kPCM16(float32, inputRate) {
-  // downsample to 16kHz via linear interpolation, then convert to int16
-  const ratio = inputRate / 16000;
-  const outLength = Math.floor(float32.length / ratio);
-  const out = new Int16Array(outLength);
-  for (let i = 0; i < outLength; i++) {
-    const srcIdx = i * ratio;
-    const i0 = Math.floor(srcIdx);
-    const i1 = Math.min(i0 + 1, float32.length - 1);
-    const frac = srcIdx - i0;
-    const sample = float32[i0] * (1 - frac) + float32[i1] * frac;
-    const clamped = Math.max(-1, Math.min(1, sample));
-    out[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
-  }
-  return out;
-}
-
-startBtn.onclick = async () => {
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-  finalText = "";
-  transcriptEl.textContent = "";
-  statusEl.textContent = "requesting mic...";
-
-  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  audioCtx = new AudioContext();
-  source = audioCtx.createMediaStreamSource(stream);
-  processor = audioCtx.createScriptProcessor(4096, 1, 1);
-
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws/transcribe`);
-  ws.onopen = () => (statusEl.textContent = "streaming...");
-  ws.onclose = () => (statusEl.textContent = "closed");
-  ws.onerror = (e) => (statusEl.textContent = "error: " + e.message);
-  ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data);
-    if (msg.event === "auto_stop") {
-      stopRecording({ sendEnd: false });
-      statusEl.textContent = "stopped (silence detected)";
-      return;
-    }
-    finalText += (finalText ? " " : "") + msg.text;
-    transcriptEl.textContent = finalText;
-  };
-
-  processor.onaudioprocess = (e) => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    const input = e.inputBuffer.getChannelData(0);
-    const pcm16 = floatTo16kPCM16(input, audioCtx.sampleRate);
-    ws.send(pcm16.buffer);
-  };
-
-  source.connect(processor);
-  processor.connect(audioCtx.destination);
-};
-
-function stopRecording({ sendEnd }) {
-  startBtn.disabled = false;
-  stopBtn.disabled = true;
-  statusEl.textContent = "stopping...";
-
-  processor && processor.disconnect();
-  source && source.disconnect();
-  stream && stream.getTracks().forEach((t) => t.stop());
-  audioCtx && audioCtx.close();
-
-  if (sendEnd && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send("end");
-  }
-}
-
-stopBtn.onclick = () => stopRecording({ sendEnd: true });
-</script>
-
-<hr />
-
-<h1>PhoWhisper Record-Then-Transcribe Test</h1>
-<p>Records locally; transcribes once (via POST /transcribe) only after you stop — either by clicking Stop or after silence auto-stops it. No streaming.</p>
-<button id="start2">Start</button>
-<button id="stop2" disabled>Stop</button>
-<div id="status2">idle</div>
-<div id="transcript2"></div>
-
-<script>
-const startBtn2 = document.getElementById("start2");
-const stopBtn2 = document.getElementById("stop2");
-const statusEl2 = document.getElementById("status2");
-const transcriptEl2 = document.getElementById("transcript2");
-
 const VAD_SILENCE_RMS_THRESHOLD = 0.01;
 const VAD_AUTO_STOP_SILENCE_SECONDS = 2.0;
 
-let mediaRecorder2, recordedChunks2, stream2, audioCtx2, source2, vadProcessor2;
-let speechDetected2 = false;
-let silenceSeconds2 = 0;
+let mediaRecorder, recordedChunks, stream, audioCtx, source, vadProcessor;
+let speechDetected = false;
+let silenceSeconds = 0;
 
 function rms(float32) {
   let sum = 0;
@@ -129,80 +37,80 @@ function rms(float32) {
   return Math.sqrt(sum / float32.length);
 }
 
-startBtn2.onclick = async () => {
-  startBtn2.disabled = true;
-  stopBtn2.disabled = false;
-  transcriptEl2.textContent = "";
-  statusEl2.textContent = "requesting mic...";
-  speechDetected2 = false;
-  silenceSeconds2 = 0;
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  transcriptEl.textContent = "";
+  statusEl.textContent = "requesting mic...";
+  speechDetected = false;
+  silenceSeconds = 0;
 
-  stream2 = await navigator.mediaDevices.getUserMedia({ audio: true });
+  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-  recordedChunks2 = [];
-  mediaRecorder2 = new MediaRecorder(stream2);
-  mediaRecorder2.ondataavailable = (e) => {
-    if (e.data.size > 0) recordedChunks2.push(e.data);
+  recordedChunks = [];
+  mediaRecorder = new MediaRecorder(stream);
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data.size > 0) recordedChunks.push(e.data);
   };
-  mediaRecorder2.onstop = async () => {
-    statusEl2.textContent = "transcribing...";
-    const blob = new Blob(recordedChunks2, { type: mediaRecorder2.mimeType });
+  mediaRecorder.onstop = async () => {
+    statusEl.textContent = "transcribing...";
+    const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType });
     const formData = new FormData();
     formData.append("file", blob, "recording.webm");
     try {
       const res = await fetch("/transcribe", { method: "POST", body: formData });
       const data = await res.json();
-      transcriptEl2.textContent = data.text || "(no speech detected)";
-      statusEl2.textContent = "done";
+      transcriptEl.textContent = data.text || "(no speech detected)";
+      statusEl.textContent = "done";
     } catch (err) {
-      statusEl2.textContent = "error: " + err.message;
+      statusEl.textContent = "error: " + err.message;
     }
   };
-  mediaRecorder2.start();
+  mediaRecorder.start();
 
   // Local silence detection only decides *when* to stop recording; the audio
   // itself is buffered client-side and sent as a single file once stopped.
-  audioCtx2 = new AudioContext();
-  source2 = audioCtx2.createMediaStreamSource(stream2);
-  vadProcessor2 = audioCtx2.createScriptProcessor(4096, 1, 1);
-  vadProcessor2.onaudioprocess = (e) => {
+  audioCtx = new AudioContext();
+  source = audioCtx.createMediaStreamSource(stream);
+  vadProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+  vadProcessor.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0);
-    const chunkDuration = input.length / audioCtx2.sampleRate;
+    const chunkDuration = input.length / audioCtx.sampleRate;
     if (rms(input) < VAD_SILENCE_RMS_THRESHOLD) {
-      if (speechDetected2) {
-        silenceSeconds2 += chunkDuration;
-        if (silenceSeconds2 >= VAD_AUTO_STOP_SILENCE_SECONDS) {
-          statusEl2.textContent = "stopped (silence detected)";
-          stopRecording2();
+      if (speechDetected) {
+        silenceSeconds += chunkDuration;
+        if (silenceSeconds >= VAD_AUTO_STOP_SILENCE_SECONDS) {
+          statusEl.textContent = "stopped (silence detected)";
+          stopRecording();
         }
       }
     } else {
-      speechDetected2 = true;
-      silenceSeconds2 = 0;
+      speechDetected = true;
+      silenceSeconds = 0;
     }
   };
-  source2.connect(vadProcessor2);
-  vadProcessor2.connect(audioCtx2.destination);
+  source.connect(vadProcessor);
+  vadProcessor.connect(audioCtx.destination);
 
-  statusEl2.textContent = "recording...";
+  statusEl.textContent = "recording...";
 };
 
-function stopRecording2() {
-  if (!mediaRecorder2 || mediaRecorder2.state === "inactive") return;
-  startBtn2.disabled = false;
-  stopBtn2.disabled = true;
+function stopRecording() {
+  if (!mediaRecorder || mediaRecorder.state === "inactive") return;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
 
-  vadProcessor2 && vadProcessor2.disconnect();
-  source2 && source2.disconnect();
-  audioCtx2 && audioCtx2.close();
-  stream2 && stream2.getTracks().forEach((t) => t.stop());
+  vadProcessor && vadProcessor.disconnect();
+  source && source.disconnect();
+  audioCtx && audioCtx.close();
+  stream && stream.getTracks().forEach((t) => t.stop());
 
-  mediaRecorder2.stop();
+  mediaRecorder.stop();
 }
 
-stopBtn2.onclick = () => {
-  statusEl2.textContent = "stopping...";
-  stopRecording2();
+stopBtn.onclick = () => {
+  statusEl.textContent = "stopping...";
+  stopRecording();
 };
 </script>
 </body>

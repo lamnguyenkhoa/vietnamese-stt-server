@@ -1,11 +1,21 @@
 # Vietnamese STT Server
 
-A FastAPI server that transcribes audio to text using [PhoWhisper-small](https://huggingface.co/vinai/PhoWhisper-small).
+A FastAPI server that transcribes audio to text using [PhoWhisper](https://huggingface.co/vinai)
+(medium by default — swap it with [switch_model](#changing-the-model-after-a-build), tiny/base/small/large also work).
 
 The app runs on [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2),
-not PyTorch — no multi-GB torch/CUDA install, and the model ships int8-quantized
-(~240MB instead of ~1GB+ in fp32/fp16). CPU inference is fast enough to use directly;
-GPU acceleration is opt-in where available (see below).
+not PyTorch — no multi-GB torch/CUDA install at runtime, and the model ships
+int8-quantized (~770MB for medium, ~240MB for small, vs 2x+ that in fp32/fp16). CPU
+inference is fast enough to use directly; GPU acceleration is opt-in where available
+(see below).
+
+## Layout
+
+Python modules live in `src/`; everything a user opens — the launchers, `config.ini`,
+`requirements.txt` — sits in the folder above them, and so do the data directories
+(`models-ct2/`, `static/`, and in a portable build `python/`, `bin/`, `cuda/`). Paths
+are resolved from [src/paths.py](src/paths.py), not from the working directory, so the
+scripts behave the same wherever you run them from.
 
 ## Prerequisites
 
@@ -15,18 +25,19 @@ GPU acceleration is opt-in where available (see below).
 
 ### Getting the model weights
 
-Fetch PhoWhisper-small's raw HF files into `models/`, then convert them to the
-CTranslate2 int8 format the app actually runs on:
+Fetch PhoWhisper-medium's raw HF files into `models/` (set `MODEL_REPO` to fetch a
+different size/checkpoint instead — see [download_model.py](src/download_model.py)),
+then convert them to the CTranslate2 int8 format the app actually runs on:
 
 ```bash
-python download_model.py
-python convert_ct2.py
+python src/download_model.py
+python src/convert_ct2.py
 ```
 
-`convert_ct2.py` needs `transformers` and `torch` installed (only for this one-time
+`src/convert_ct2.py` needs `transformers` and `torch` installed (only for this one-time
 conversion — `pip install transformers torch`; CPU-only torch is fine even for a GPU
 deployment, since it's only used to read the weights, not run them). Neither is needed
-at runtime. This produces `models-ct2/` (~240MB).
+at runtime. This produces `models-ct2/` (~770MB for medium, ~240MB for small).
 
 ## Run the server
 
@@ -34,14 +45,14 @@ at runtime. This produces `models-ct2/` (~240MB).
 python -m venv venv
 ./venv/Scripts/activate      # Windows
 pip install -r requirements.txt
-python download_model.py
-python convert_ct2.py        # needs `pip install transformers torch` first
+python src/download_model.py
+python src/convert_ct2.py    # needs `pip install transformers torch` first
 ```
 
 Then start it:
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8123
+uvicorn main:app --app-dir src --host 0.0.0.0 --port 8123
 ```
 
 Then you can go to localhost:8123/docs to test it.
@@ -65,16 +76,17 @@ so nothing multi-GB is required to *run* the server; the default build is CPU-on
 keeps CPU torch installed purely as the model converter (see
 [Changing the model](#changing-the-model-after-a-build) below).
 
-The script is fully self-contained — the app source (`main.py`, `download_model.py`,
-`convert_ct2.py`, `switch_model.py`, `enable_gpu.py`, `requirements.txt`,
-`static/index.html`) is embedded directly in it,
-so it does **not** need a repo checkout or pre-downloaded model weights. You can copy
-just this one file anywhere and run it there.
+The script is fully self-contained — the app source (everything in `src/`, plus
+`requirements.txt` and `static/index.html`) is embedded directly in it, so it does
+**not** need a repo checkout or pre-downloaded model weights. You can copy just this
+one file anywhere and run it there.
 
 Run this from **PowerShell** (not Git Bash/WSL — the script uses PowerShell syntax):
 
 ```powershell
 .\build_portable.ps1
+.\build_portable.ps1 -OutDir C:\deploy\vietnamese-stt-server
+.\build_portable.ps1 -Model medium -IncludeCuda
 ```
 
 Run it directly **on the target server** if that machine has internet access — no need
@@ -84,18 +96,35 @@ pip, model weights from Hugging Face, and a static ffmpeg build from
 internet access, run it on a dev machine instead, then zip and copy the output folder
 over.
 
-This produces `dist\vietnamese-stt-server-portable\`. Run `run.bat` from that folder (or
-copy the whole folder to another machine first). It sets `MODEL_DIR` and `FFMPEG_BIN` to
-point at the bundled copies and starts uvicorn.
+This produces `dist\vietnamese-stt-server-portable\`, laid out so the only things in
+its root are the ones you might want to open:
+
+```
+run.bat            start the server
+switch_model.bat   change the checkpoint
+enable_gpu.bat     add GPU support
+config.ini         host/port/device
+model_id.txt       which checkpoint is installed
+src\                the Python modules
+python\ bin\ cuda\ models-ct2\ static\
+```
+
+Run `run.bat` from that folder (or copy the whole folder to another machine first). It
+sets `MODEL_DIR` and `FFMPEG_BIN` to point at the bundled copies and starts uvicorn.
 
 To change the host/port after building (e.g. on the target server, no rebuild needed),
 edit `config.ini` in the output folder:
 
 ```ini
 HOST=0.0.0.0
-PORT=8123
+PORT=8000
 CUDA_VISIBLE_DEVICES=
 ```
+
+`CUDA_VISIBLE_DEVICES` is useful on a multi-GPU machine shared with other processes:
+set it to `0` or `1` to pin the server to a specific, less-contended GPU.
+
+`run.bat` reads `config.ini` on every start.
 
 ### Adding GPU support after a build
 
@@ -112,8 +141,9 @@ bundle the same DLLs up front.
 
 ### Changing the model after a build
 
-The shipped checkpoint is `vinai/PhoWhisper-small`. Pick a different one at build time
-with `-Model medium`, or swap it later from the output folder:
+The shipped checkpoint is `vinai/PhoWhisper-medium` (set with `-Model` at build time;
+`tiny`/`base`/`small`/`large` also work, as does any HF repo id). Swap it later from
+the output folder:
 
 ```powershell
 .\switch_model.bat medium              # tiny | base | small | medium | large
@@ -128,11 +158,6 @@ the output — the CTranslate2 converter reads HF checkpoints through them, on C
 Build with `-StripTorch` to drop them (~1GB smaller) if the model never needs to
 change; `switch_model.bat` is then omitted from the output.
 
-`CUDA_VISIBLE_DEVICES` is useful on a multi-GPU machine shared with other processes:
-set it to `0` or `1` to pin the server to a specific, less-contended GPU.
-
-`run.bat` reads `config.ini` on every start.
-
 ### Building from the local checkout (offline)
 
 [build_local.ps1](build_local.ps1) produces the same output folder, but assembled from
@@ -145,13 +170,13 @@ a deploy, or for building on a machine with no (or slow) internet:
 .\build_local.ps1 -Offline   # fail instead of downloading anything
 ```
 
-It takes the app code from the working tree, the model from your local `models-ct2\`
-(no Hugging Face download, no re-conversion), `ffmpeg.exe` from `PATH` (override with
-`-FfmpegExe`), and the dependencies out of `venv\Lib\site-packages` — so the build is
-seconds, not minutes, and ships exactly the package versions you tested against.
-[collect_deps.py](collect_deps.py) resolves the dependency closure of
-`requirements.txt` from the venv's installed metadata, so dev-only extras that also
-live in the venv (torch, transformers, …) are left out of the shipped folder.
+It takes the app code from the working tree (`src\` modules), the model from your
+local `models-ct2\` (no Hugging Face download, no re-conversion), `ffmpeg.exe` from
+`PATH` (override with `-FfmpegExe`), and the dependencies out of `venv\Lib\site-packages`
+— so the build is seconds, not minutes, and ships exactly the package versions you
+tested against. [src/collect_deps.py](src/collect_deps.py) resolves the dependency
+closure of `requirements.txt` from the venv's installed metadata, so dev-only extras
+that also live in the venv (torch, transformers, …) are left out of the shipped folder.
 
 The one thing that can't come from the working tree is the standalone Python runtime —
 a venv has no interpreter to ship. The embeddable distribution is downloaded once and
@@ -162,10 +187,53 @@ built against that ABI; the script defaults to the venv's exact version.
 The build finishes by importing the whole stack with the bundled interpreter, so a
 missing dependency fails the build rather than the first run on the server.
 
+## Portable Linux deployment
+
+[build_portable.sh](build_portable.sh) is the Linux counterpart of
+`build_portable.ps1`: same self-contained design (the app source is embedded in the
+script, so you can copy just this one file to a server with no repo checkout), same
+CPU-only-by-default / switchable GPU and model, same output layout (`src/` for the
+Python modules, everything else in the root). Run it on Linux itself (or WSL with a
+native Linux filesystem -- it extracts an archive containing symlinks, which a
+Windows-mounted path can't create).
+
+Instead of the Windows embeddable zip, it downloads a standalone CPython build from
+[python-build-standalone](https://github.com/astral-sh/python-build-standalone) (the
+same project `uv`/`rye` use) -- a real interpreter with no dependency on whatever
+Python the target machine has or lacks. ffmpeg comes from a static build at
+[johnvansickle.com](https://johnvansickle.com/ffmpeg/), and GPU support from the same
+`nvidia-cublas-cu12`/`nvidia-cudnn-cu12` wheels as the Windows build, just with `.so`
+files and `LD_LIBRARY_PATH` instead of `.dll` files and the DLL search path.
+
+```bash
+./build_portable.sh
+./build_portable.sh --out-dir /opt/vietnamese-stt-server
+./build_portable.sh --model medium --include-cuda
+```
+
+This produces `dist/vietnamese-stt-server-portable-linux/`, laid out the same way as
+the Windows build:
+
+```
+run.sh              start the server
+switch_model.sh      change the checkpoint
+enable_gpu.sh        add GPU support
+config.ini           host/port/device
+model_id.txt         which checkpoint is installed
+src/                 the Python modules
+python/ bin/ cuda/ models-ct2/ static/
+```
+
+`--include-cuda` and `--strip-torch` mirror `-IncludeCuda`/`-StripTorch` on the
+Windows script (see [Adding GPU support](#adding-gpu-support-after-a-build) and
+[Changing the model](#changing-the-model-after-a-build) above -- the same trade-offs
+apply here; the default checkpoint is likewise `vinai/PhoWhisper-medium`).
+
+There's no Linux equivalent of `build_local.ps1` yet; contributions welcome.
+
 ## API
 
 - `POST /transcribe` — multipart file upload (`file`), returns `{"text": "..."}`
-- `WS /ws/transcribe` — streaming transcription over a WebSocket (see below)
 - `GET /health` — returns `{"status": "ok", "device": "cuda" | "cpu", "model": "..."}`
 
 Example:
@@ -174,68 +242,18 @@ Example:
 curl -X POST http://localhost:8123/transcribe -F "file=@sample.wav"
 ```
 
-### Streaming transcription (`/ws/transcribe`)
-
-Whisper isn't a natively streaming model, so this endpoint buffers incoming audio and
-transcribes it in fixed-size chunks (`STREAM_CHUNK_SECONDS`, default 3s) rather than
-returning individual tokens as they're spoken. Expect a few seconds of latency per
-result, and occasionally a word getting split across two chunks.
-
-**Protocol:**
-
-1. Open a WebSocket connection to `ws://<host>:8123/ws/transcribe`.
-2. Stream raw audio as binary frames — **16-bit signed little-endian PCM, mono,
-   16000 Hz** (no container/codec — do not send WAV/MP3/Opus bytes directly). If you're
-   capturing from a browser mic, you'll need to downsample/convert to this format
-   client-side first (see `static/index.html` for a working example).
-3. Every time the server has buffered `STREAM_CHUNK_SECONDS` worth of audio, it runs
-   inference on that chunk and sends back a JSON text frame:
-   ```json
-   {"text": "...", "final": false}
-   ```
-   Near-silent chunks (below `SILENCE_RMS_THRESHOLD`) are skipped rather than
-   transcribed, to avoid Whisper hallucinating text from silence.
-4. When you're done speaking, send a text frame with the literal string `"end"`. The
-   server transcribes whatever's left in the buffer, sends a final message:
-   ```json
-   {"text": "...", "final": true}
-   ```
-   and closes the socket. (Simply closing the connection without sending `"end"`
-   also works, but you lose the last partial chunk.)
-
 **Try it in a browser:** start the server and open
-`http://localhost:8123/static/index.html` — it captures your mic, streams audio to
-`/ws/transcribe`, and renders the transcript live.
+`http://localhost:8123/static/index.html` — it records from your mic, stops on a
+click or after ~2s of silence, and posts the whole recording to `/transcribe`.
 
-**Minimal Python client** (streaming from a WAV file for testing):
-
-```python
-import asyncio
-import websockets
-import soundfile as sf
-import numpy as np
-
-async def main():
-    audio, sr = sf.read("sample.wav", dtype="float32")
-    assert sr == 16000, "resample to 16kHz first"
-    pcm16 = (audio * 32767).astype(np.int16).tobytes()
-
-    async with websockets.connect("ws://localhost:8123/ws/transcribe") as ws:
-        chunk_size = 4096
-        for i in range(0, len(pcm16), chunk_size):
-            await ws.send(pcm16[i : i + chunk_size])
-        await ws.send("end")
-
-        async for message in ws:
-            print(message)
-
-asyncio.run(main())
-```
+Transcription is whole-file only: the audio is decoded with ffmpeg, so any container
+or codec ffmpeg understands works (WAV, MP3, Opus, the browser's WebM, …).
 
 ## Configuration
 
 | Env var | Default | Description |
 |-|-|
-| `MODEL_DIR` | `models-ct2` | Path to the CTranslate2-format model directory (see `convert_ct2.py`) |
+| `MODEL_DIR` | `models-ct2` | Path to the CTranslate2-format model directory (see `src/convert_ct2.py`) |
+| `MODEL_REPO` | `vinai/PhoWhisper-medium` | Checkpoint `src/download_model.py` fetches; a size shortcut (`tiny`/`base`/`small`/`medium`/`large`) or any HF repo id. Overrides `model_id.txt` |
 | `DEVICE` | `auto` | `cuda`, `cpu`, or `auto` to use GPU when available |
 | `COMPUTE_TYPE` | `int8` on CPU, `float16` on GPU | CTranslate2 compute type, e.g. `int8`, `int8_float16`, `float16`, `float32` |
