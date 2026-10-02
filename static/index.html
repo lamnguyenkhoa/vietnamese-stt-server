@@ -6,28 +6,34 @@
 <style>
   body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
   button { font-size: 16px; padding: 8px 20px; margin-right: 8px; }
+  label { margin-left: 8px; }
   #status { color: #666; margin: 12px 0; }
   #transcript { border: 1px solid #ccc; border-radius: 6px; padding: 12px; min-height: 120px; white-space: pre-wrap; }
+  #transcript.preview { color: #888; font-style: italic; }
 </style>
 </head>
 <body>
 <h1>PhoWhisper Transcribe Test</h1>
-<p>Records locally; transcribes once (via POST /transcribe) only after you stop — either by clicking Stop or after silence auto-stops it.</p>
+<p>Records locally; transcribes once (via POST /transcribe) only after you stop — either by clicking Stop or after silence auto-stops it.
+With live preview on, audio is also streamed to /ws/stream while you speak, and the rough preview (grey) is replaced by the whole-recording result when it arrives.</p>
 <button id="start">Start</button>
 <button id="stop" disabled>Stop</button>
+<label><input type="checkbox" id="preview" checked /> Live preview</label>
 <div id="status">idle</div>
 <div id="transcript"></div>
 
 <script>
 const startBtn = document.getElementById("start");
 const stopBtn = document.getElementById("stop");
+const previewCheckbox = document.getElementById("preview");
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 
 const VAD_SILENCE_RMS_THRESHOLD = 0.01;
 const VAD_AUTO_STOP_SILENCE_SECONDS = 2.0;
+const STREAM_SAMPLE_RATE = 16000;
 
-let mediaRecorder, recordedChunks, stream, audioCtx, source, vadProcessor;
+let mediaRecorder, recordedChunks, stream, audioCtx, source, vadProcessor, previewSocket;
 let speechDetected = false;
 let silenceSeconds = 0;
 
@@ -37,10 +43,45 @@ function rms(float32) {
   return Math.sqrt(sum / float32.length);
 }
 
+// Average-downsample to 16kHz and convert to PCM16, the format /ws/stream expects.
+// Crude, but the preview is only for show.
+function toPcm16(float32, inRate) {
+  const ratio = inRate / STREAM_SAMPLE_RATE;
+  const out = new Int16Array(Math.floor(float32.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(Math.floor((i + 1) * ratio), float32.length);
+    let sum = 0;
+    for (let j = start; j < end; j++) sum += float32[j];
+    const s = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+function openPreviewSocket() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws/stream`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (e) => {
+    // Ignore anything arriving after Stop -- the final result owns the transcript then.
+    if (ws !== previewSocket) return;
+    const data = JSON.parse(e.data);
+    transcriptEl.textContent = data.text;
+  };
+  return ws;
+}
+
+function closePreviewSocket() {
+  if (previewSocket) previewSocket.close();
+  previewSocket = null;
+}
+
 startBtn.onclick = async () => {
   startBtn.disabled = true;
   stopBtn.disabled = false;
   transcriptEl.textContent = "";
+  transcriptEl.classList.toggle("preview", previewCheckbox.checked);
   statusEl.textContent = "requesting mic...";
   speechDetected = false;
   silenceSeconds = 0;
@@ -61,6 +102,7 @@ startBtn.onclick = async () => {
       const res = await fetch("/transcribe", { method: "POST", body: formData });
       const data = await res.json();
       transcriptEl.textContent = data.text || "(no speech detected)";
+      transcriptEl.classList.remove("preview");
       statusEl.textContent = "done";
     } catch (err) {
       statusEl.textContent = "error: " + err.message;
@@ -68,14 +110,20 @@ startBtn.onclick = async () => {
   };
   mediaRecorder.start();
 
-  // Local silence detection only decides *when* to stop recording; the audio
-  // itself is buffered client-side and sent as a single file once stopped.
+  if (previewCheckbox.checked) previewSocket = openPreviewSocket();
+
+  // Local silence detection decides *when* to stop recording; the same audio is also
+  // streamed for the live preview. The final transcript always comes from the whole
+  // recording, buffered client-side and sent as a single file once stopped.
   audioCtx = new AudioContext();
   source = audioCtx.createMediaStreamSource(stream);
   vadProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
   vadProcessor.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0);
     const chunkDuration = input.length / audioCtx.sampleRate;
+    if (previewSocket && previewSocket.readyState === WebSocket.OPEN) {
+      previewSocket.send(toPcm16(input, audioCtx.sampleRate).buffer);
+    }
     if (rms(input) < VAD_SILENCE_RMS_THRESHOLD) {
       if (speechDetected) {
         silenceSeconds += chunkDuration;
@@ -100,6 +148,7 @@ function stopRecording() {
   startBtn.disabled = false;
   stopBtn.disabled = true;
 
+  closePreviewSocket();
   vadProcessor && vadProcessor.disconnect();
   source && source.disconnect();
   audioCtx && audioCtx.close();

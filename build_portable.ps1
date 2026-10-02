@@ -66,6 +66,7 @@ $ErrorActionPreference = "Stop"
 # ---------------------------------------------------------------------------
 
 $MainPy = @'
+import asyncio
 import logging
 import os
 import shutil
@@ -99,13 +100,20 @@ import ctranslate2
 import numpy as np
 import soundfile as sf
 from faster_whisper import WhisperModel
-from fastapi import FastAPI, HTTPException, UploadFile
+from faster_whisper.vad import get_speech_timestamps
+from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from download_model import current_repo_id
 
 MODEL_DIR = os.environ.get("MODEL_DIR") or str(paths.MODEL_CT2_DIR)
 SAMPLE_RATE = 16000
+# Live preview (/ws/stream): re-transcribe the in-progress window whenever at least
+# STREAM_UPDATE_SECONDS of new audio has arrived, and commit the window once it reaches
+# STREAM_WINDOW_SECONDS so each pass stays short. Preview accuracy is secondary --
+# clients are expected to POST the whole recording to /transcribe for the final text.
+STREAM_UPDATE_SECONDS = float(os.environ.get("STREAM_UPDATE_SECONDS", "1.0"))
+STREAM_WINDOW_SECONDS = float(os.environ.get("STREAM_WINDOW_SECONDS", "8.0"))
 
 # Resolve ffmpeg: explicit override, then PATH, then a copy bundled alongside the app
 # (used by the portable Windows package, which ships its own ffmpeg.exe).
@@ -221,6 +229,13 @@ def load_audio(raw_bytes: bytes) -> "list[float]":
 
 
 def transcribe_array(audio: "np.ndarray") -> str:
+    # Whisper never outputs "nothing": fed silence or room noise it hallucinates fluent
+    # Vietnamese sentences. Gate on Silero VAD (bundled with faster-whisper) and return
+    # "" when it hears no speech. Only a gate, though -- passing vad_filter=True to
+    # transcribe() instead also splices the audio down to the speech regions, which
+    # measurably hurt accuracy on real clips.
+    if not get_speech_timestamps(audio):
+        return ""
     model = model_state["model"]
     # beam_size=1 (greedy) matches the decoding this PhoWhisper checkpoint was
     # actually used with before this migration (transformers' plain .generate(), which
@@ -234,8 +249,62 @@ def transcribe_array(audio: "np.ndarray") -> str:
 @app.post("/transcribe")
 async def transcribe(file: UploadFile):
     raw_bytes = await file.read()
-    audio = load_audio(raw_bytes)
-    return {"text": transcribe_array(audio)}
+    # Run decode + inference off the event loop so live-preview sockets stay responsive.
+    audio = await asyncio.to_thread(load_audio, raw_bytes)
+    return {"text": await asyncio.to_thread(transcribe_array, audio)}
+
+
+@app.websocket("/ws/stream")
+async def stream(websocket: WebSocket):
+    """Live preview transcription, meant to run alongside a client-side recording.
+
+    The client sends raw PCM16LE mono 16kHz audio as binary frames and closes the socket
+    when done. The server replies with {"text": "..."} -- the full preview so far, which
+    replaces the previous one. Only one inference runs at a time per socket; audio that
+    arrives meanwhile is picked up by the next pass, so a slow device just updates less
+    often instead of falling behind.
+    """
+    await websocket.accept()
+    update_samples = int(STREAM_UPDATE_SECONDS * SAMPLE_RATE)
+    window_samples = int(STREAM_WINDOW_SECONDS * SAMPLE_RATE)
+    window = np.empty(0, dtype=np.float32)  # audio since the last commit
+    committed: "list[str]" = []
+    audio_arrived = asyncio.Event()
+
+    async def preview_loop():
+        nonlocal window
+        transcribed_len = 0
+        while True:
+            await audio_arrived.wait()
+            audio_arrived.clear()
+            if len(window) - transcribed_len < update_samples:
+                continue
+            snapshot = window
+            transcribed_len = len(snapshot)
+            text = await asyncio.to_thread(transcribe_array, snapshot)
+            if len(snapshot) >= window_samples:
+                if text:
+                    committed.append(text)
+                # The receiver only ever appends, so everything past the snapshot is new.
+                window = window[len(snapshot):]
+                transcribed_len = 0
+                text = ""
+            await websocket.send_json({"text": " ".join(committed + [text]).strip()})
+
+    preview_task = asyncio.create_task(preview_loop())
+    try:
+        while not preview_task.done():
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            if message.get("bytes"):
+                pcm16 = np.frombuffer(message["bytes"], dtype=np.int16)
+                window = np.concatenate([window, pcm16.astype(np.float32) / 32768.0])
+                audio_arrived.set()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        preview_task.cancel()
 
 
 @app.get("/health")
@@ -560,28 +629,34 @@ $IndexHtml = @'
 <style>
   body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
   button { font-size: 16px; padding: 8px 20px; margin-right: 8px; }
+  label { margin-left: 8px; }
   #status { color: #666; margin: 12px 0; }
   #transcript { border: 1px solid #ccc; border-radius: 6px; padding: 12px; min-height: 120px; white-space: pre-wrap; }
+  #transcript.preview { color: #888; font-style: italic; }
 </style>
 </head>
 <body>
 <h1>PhoWhisper Transcribe Test</h1>
-<p>Records locally; transcribes once (via POST /transcribe) only after you stop — either by clicking Stop or after silence auto-stops it.</p>
+<p>Records locally; transcribes once (via POST /transcribe) only after you stop — either by clicking Stop or after silence auto-stops it.
+With live preview on, audio is also streamed to /ws/stream while you speak, and the rough preview (grey) is replaced by the whole-recording result when it arrives.</p>
 <button id="start">Start</button>
 <button id="stop" disabled>Stop</button>
+<label><input type="checkbox" id="preview" checked /> Live preview</label>
 <div id="status">idle</div>
 <div id="transcript"></div>
 
 <script>
 const startBtn = document.getElementById("start");
 const stopBtn = document.getElementById("stop");
+const previewCheckbox = document.getElementById("preview");
 const statusEl = document.getElementById("status");
 const transcriptEl = document.getElementById("transcript");
 
 const VAD_SILENCE_RMS_THRESHOLD = 0.01;
 const VAD_AUTO_STOP_SILENCE_SECONDS = 2.0;
+const STREAM_SAMPLE_RATE = 16000;
 
-let mediaRecorder, recordedChunks, stream, audioCtx, source, vadProcessor;
+let mediaRecorder, recordedChunks, stream, audioCtx, source, vadProcessor, previewSocket;
 let speechDetected = false;
 let silenceSeconds = 0;
 
@@ -591,10 +666,45 @@ function rms(float32) {
   return Math.sqrt(sum / float32.length);
 }
 
+// Average-downsample to 16kHz and convert to PCM16, the format /ws/stream expects.
+// Crude, but the preview is only for show.
+function toPcm16(float32, inRate) {
+  const ratio = inRate / STREAM_SAMPLE_RATE;
+  const out = new Int16Array(Math.floor(float32.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const start = Math.floor(i * ratio);
+    const end = Math.min(Math.floor((i + 1) * ratio), float32.length);
+    let sum = 0;
+    for (let j = start; j < end; j++) sum += float32[j];
+    const s = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return out;
+}
+
+function openPreviewSocket() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws/stream`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (e) => {
+    // Ignore anything arriving after Stop -- the final result owns the transcript then.
+    if (ws !== previewSocket) return;
+    const data = JSON.parse(e.data);
+    transcriptEl.textContent = data.text;
+  };
+  return ws;
+}
+
+function closePreviewSocket() {
+  if (previewSocket) previewSocket.close();
+  previewSocket = null;
+}
+
 startBtn.onclick = async () => {
   startBtn.disabled = true;
   stopBtn.disabled = false;
   transcriptEl.textContent = "";
+  transcriptEl.classList.toggle("preview", previewCheckbox.checked);
   statusEl.textContent = "requesting mic...";
   speechDetected = false;
   silenceSeconds = 0;
@@ -615,6 +725,7 @@ startBtn.onclick = async () => {
       const res = await fetch("/transcribe", { method: "POST", body: formData });
       const data = await res.json();
       transcriptEl.textContent = data.text || "(no speech detected)";
+      transcriptEl.classList.remove("preview");
       statusEl.textContent = "done";
     } catch (err) {
       statusEl.textContent = "error: " + err.message;
@@ -622,14 +733,20 @@ startBtn.onclick = async () => {
   };
   mediaRecorder.start();
 
-  // Local silence detection only decides *when* to stop recording; the audio
-  // itself is buffered client-side and sent as a single file once stopped.
+  if (previewCheckbox.checked) previewSocket = openPreviewSocket();
+
+  // Local silence detection decides *when* to stop recording; the same audio is also
+  // streamed for the live preview. The final transcript always comes from the whole
+  // recording, buffered client-side and sent as a single file once stopped.
   audioCtx = new AudioContext();
   source = audioCtx.createMediaStreamSource(stream);
   vadProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
   vadProcessor.onaudioprocess = (e) => {
     const input = e.inputBuffer.getChannelData(0);
     const chunkDuration = input.length / audioCtx.sampleRate;
+    if (previewSocket && previewSocket.readyState === WebSocket.OPEN) {
+      previewSocket.send(toPcm16(input, audioCtx.sampleRate).buffer);
+    }
     if (rms(input) < VAD_SILENCE_RMS_THRESHOLD) {
       if (speechDetected) {
         silenceSeconds += chunkDuration;
@@ -654,6 +771,7 @@ function stopRecording() {
   startBtn.disabled = false;
   stopBtn.disabled = true;
 
+  closePreviewSocket();
   vadProcessor && vadProcessor.disconnect();
   source && source.disconnect();
   audioCtx && audioCtx.close();

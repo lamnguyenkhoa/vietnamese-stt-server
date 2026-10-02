@@ -234,6 +234,12 @@ There's no Linux equivalent of `build_local.ps1` yet; contributions welcome.
 ## API
 
 - `POST /transcribe` — multipart file upload (`file`), returns `{"text": "..."}`
+- `WS /ws/stream` — live *preview* transcription. Send raw PCM16LE mono 16kHz audio as
+  binary frames; receive `{"text": "..."}` (the whole preview so far, replacing the
+  previous one) about once a second. Close the socket when done. The preview is
+  produced from short windows of audio, so it's less accurate. Use it for instant
+  feedback while the user speaks, then POST the full recording to `/transcribe` and
+  replace the preview with that result.
 - `GET /health` — returns `{"status": "ok", "device": "cuda" | "cpu", "model": "..."}`
 
 Example:
@@ -244,9 +250,11 @@ curl -X POST http://localhost:8123/transcribe -F "file=@sample.wav"
 
 **Try it in a browser:** start the server and open
 `http://localhost:8123/static/index.html` — it records from your mic, stops on a
-click or after ~2s of silence, and posts the whole recording to `/transcribe`.
+click or after ~2s of silence, and posts the whole recording to `/transcribe`. With
+"Live preview" checked, it also streams to `/ws/stream` while you speak, showing a grey
+preview that the final `/transcribe` result replaces.
 
-Transcription is whole-file only: the audio is decoded with ffmpeg, so any container
+`/transcribe` decodes the audio with ffmpeg, so any container
 or codec ffmpeg understands works (WAV, MP3, Opus, the browser's WebM, …).
 
 ## Configuration
@@ -257,3 +265,5 @@ or codec ffmpeg understands works (WAV, MP3, Opus, the browser's WebM, …).
 | `MODEL_REPO` | `vinai/PhoWhisper-medium` | Checkpoint `src/download_model.py` fetches; a size shortcut (`tiny`/`base`/`small`/`medium`/`large`) or any HF repo id. Overrides `model_id.txt` |
 | `DEVICE` | `auto` | `cuda`, `cpu`, or `auto` to use GPU when available |
 | `COMPUTE_TYPE` | `int8` on CPU, `float16` on GPU | CTranslate2 compute type, e.g. `int8`, `int8_float16`, `float16`, `float32` |
+| `STREAM_UPDATE_SECONDS` | `1.0` | `/ws/stream`: minimum amount of new audio before the preview is re-run |
+| `STREAM_WINDOW_SECONDS` | `8.0` | `/ws/stream`: the in-progress window is committed and a new one starts once it reaches this length |

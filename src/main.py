@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import shutil
@@ -31,13 +32,20 @@ import ctranslate2
 import numpy as np
 import soundfile as sf
 from faster_whisper import WhisperModel
-from fastapi import FastAPI, HTTPException, UploadFile
+from faster_whisper.vad import get_speech_timestamps
+from fastapi import FastAPI, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from download_model import current_repo_id
 
 MODEL_DIR = os.environ.get("MODEL_DIR") or str(paths.MODEL_CT2_DIR)
 SAMPLE_RATE = 16000
+# Live preview (/ws/stream): re-transcribe the in-progress window whenever at least
+# STREAM_UPDATE_SECONDS of new audio has arrived, and commit the window once it reaches
+# STREAM_WINDOW_SECONDS so each pass stays short. Preview accuracy is secondary --
+# clients are expected to POST the whole recording to /transcribe for the final text.
+STREAM_UPDATE_SECONDS = float(os.environ.get("STREAM_UPDATE_SECONDS", "1.0"))
+STREAM_WINDOW_SECONDS = float(os.environ.get("STREAM_WINDOW_SECONDS", "8.0"))
 
 # Resolve ffmpeg: explicit override, then PATH, then a copy bundled alongside the app
 # (used by the portable Windows package, which ships its own ffmpeg.exe).
@@ -153,6 +161,13 @@ def load_audio(raw_bytes: bytes) -> "list[float]":
 
 
 def transcribe_array(audio: "np.ndarray") -> str:
+    # Whisper never outputs "nothing": fed silence or room noise it hallucinates fluent
+    # Vietnamese sentences. Gate on Silero VAD (bundled with faster-whisper) and return
+    # "" when it hears no speech. Only a gate, though -- passing vad_filter=True to
+    # transcribe() instead also splices the audio down to the speech regions, which
+    # measurably hurt accuracy on real clips.
+    if not get_speech_timestamps(audio):
+        return ""
     model = model_state["model"]
     # beam_size=1 (greedy) matches the decoding this PhoWhisper checkpoint was
     # actually used with before this migration (transformers' plain .generate(), which
@@ -166,8 +181,62 @@ def transcribe_array(audio: "np.ndarray") -> str:
 @app.post("/transcribe")
 async def transcribe(file: UploadFile):
     raw_bytes = await file.read()
-    audio = load_audio(raw_bytes)
-    return {"text": transcribe_array(audio)}
+    # Run decode + inference off the event loop so live-preview sockets stay responsive.
+    audio = await asyncio.to_thread(load_audio, raw_bytes)
+    return {"text": await asyncio.to_thread(transcribe_array, audio)}
+
+
+@app.websocket("/ws/stream")
+async def stream(websocket: WebSocket):
+    """Live preview transcription, meant to run alongside a client-side recording.
+
+    The client sends raw PCM16LE mono 16kHz audio as binary frames and closes the socket
+    when done. The server replies with {"text": "..."} -- the full preview so far, which
+    replaces the previous one. Only one inference runs at a time per socket; audio that
+    arrives meanwhile is picked up by the next pass, so a slow device just updates less
+    often instead of falling behind.
+    """
+    await websocket.accept()
+    update_samples = int(STREAM_UPDATE_SECONDS * SAMPLE_RATE)
+    window_samples = int(STREAM_WINDOW_SECONDS * SAMPLE_RATE)
+    window = np.empty(0, dtype=np.float32)  # audio since the last commit
+    committed: "list[str]" = []
+    audio_arrived = asyncio.Event()
+
+    async def preview_loop():
+        nonlocal window
+        transcribed_len = 0
+        while True:
+            await audio_arrived.wait()
+            audio_arrived.clear()
+            if len(window) - transcribed_len < update_samples:
+                continue
+            snapshot = window
+            transcribed_len = len(snapshot)
+            text = await asyncio.to_thread(transcribe_array, snapshot)
+            if len(snapshot) >= window_samples:
+                if text:
+                    committed.append(text)
+                # The receiver only ever appends, so everything past the snapshot is new.
+                window = window[len(snapshot):]
+                transcribed_len = 0
+                text = ""
+            await websocket.send_json({"text": " ".join(committed + [text]).strip()})
+
+    preview_task = asyncio.create_task(preview_loop())
+    try:
+        while not preview_task.done():
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+            if message.get("bytes"):
+                pcm16 = np.frombuffer(message["bytes"], dtype=np.int16)
+                window = np.concatenate([window, pcm16.astype(np.float32) / 32768.0])
+                audio_arrived.set()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        preview_task.cancel()
 
 
 @app.get("/health")
