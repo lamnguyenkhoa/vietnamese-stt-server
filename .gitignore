@@ -9,3 +9,4 @@ dist
 *.rar
 vendor
 model_id.txt
+*.pem

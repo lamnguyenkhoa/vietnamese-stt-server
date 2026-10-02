@@ -257,9 +257,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8123")))
+    # HTTPS: browsers only allow the web page's mic access on https:// (or localhost).
+    # make_cert.py creates a self-signed pair.
+    parser.add_argument("--ssl-certfile", default=os.environ.get("SSL_CERTFILE") or None)
+    parser.add_argument("--ssl-keyfile", default=os.environ.get("SSL_KEYFILE") or None)
     args = parser.parse_args()
 
     if args.device:
         os.environ["DEVICE"] = args.device
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        ssl_certfile=args.ssl_certfile,
+        ssl_keyfile=args.ssl_keyfile,
+    )

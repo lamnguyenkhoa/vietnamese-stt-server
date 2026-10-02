@@ -5,3 +5,4 @@ faster-whisper
 huggingface_hub
 soundfile
 numpy
+cryptography

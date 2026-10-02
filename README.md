@@ -57,6 +57,19 @@ uvicorn main:app --app-dir src --host 0.0.0.0 --port 8123
 
 Then you can go to localhost:8123/docs to test it.
 
+**HTTPS (for the browser mic):** browsers only let a page use the microphone over
+`https://` or on `localhost`, so the test page can't record when you open it as
+`http://<server-ip>:8123`. Create a self-signed certificate (valid for localhost, this
+machine's hostname and IPs, plus any extra names/IPs you pass) and start with it:
+
+```bash
+python src/make_cert.py                 # or make_cert.bat; writes cert.pem/key.pem
+uvicorn main:app --app-dir src --host 0.0.0.0 --port 8123 --ssl-certfile cert.pem --ssl-keyfile key.pem
+```
+
+Then open `https://<server-ip>:8123/static/index.html` and accept the browser's
+self-signed certificate warning once. Re-run `make_cert` if the server's IP changes.
+
 **GPU note:** `faster-whisper`'s CTranslate2 backend doesn't bundle its own CUDA
 runtime the way PyTorch's pip wheels do, so GPU acceleration needs cuBLAS (CUDA 12)
 and cuDNN 9 available to the process on top of a compatible NVIDIA driver (see
@@ -103,7 +116,8 @@ its root are the ones you might want to open:
 run.bat            start the server
 switch_model.bat   change the checkpoint
 enable_gpu.bat     add GPU support
-config.ini         host/port/device
+make_cert.bat      create an HTTPS certificate (needed for the browser mic)
+config.ini         host/port/device/HTTPS
 model_id.txt       which checkpoint is installed
 src\                the Python modules
 python\ bin\ cuda\ models-ct2\ static\
@@ -119,10 +133,18 @@ edit `config.ini` in the output folder:
 HOST=0.0.0.0
 PORT=8000
 CUDA_VISIBLE_DEVICES=
+SSL_CERTFILE=
+SSL_KEYFILE=
 ```
 
 `CUDA_VISIBLE_DEVICES` is useful on a multi-GPU machine shared with other processes:
 set it to `0` or `1` to pin the server to a specific, less-contended GPU.
+
+`SSL_CERTFILE`/`SSL_KEYFILE` switch the server to HTTPS, which the test page needs to
+access the microphone from any machine other than the server itself. Run
+`make_cert.bat` once on the target server: it creates a self-signed `cert.pem`/`key.pem`
+for that machine's hostname and IPs and fills both settings in. Restart `run.bat`, then
+open `https://<server-ip>:<port>/static/index.html` and accept the certificate warning.
 
 `run.bat` reads `config.ini` on every start.
 
@@ -158,35 +180,6 @@ the output — the CTranslate2 converter reads HF checkpoints through them, on C
 Build with `-StripTorch` to drop them (~1GB smaller) if the model never needs to
 change; `switch_model.bat` is then omitted from the output.
 
-### Building from the local checkout (offline)
-
-[build_local.ps1](build_local.ps1) produces the same output folder, but assembled from
-what is already on this machine instead of from the internet — useful for iterating on
-a deploy, or for building on a machine with no (or slow) internet:
-
-```powershell
-.\build_local.ps1            # -> dist\vietnamese-stt-server-local\
-.\build_local.ps1 -Zip       # also writes dist\vietnamese-stt-server-local.zip
-.\build_local.ps1 -Offline   # fail instead of downloading anything
-```
-
-It takes the app code from the working tree (`src\` modules), the model from your
-local `models-ct2\` (no Hugging Face download, no re-conversion), `ffmpeg.exe` from
-`PATH` (override with `-FfmpegExe`), and the dependencies out of `venv\Lib\site-packages`
-— so the build is seconds, not minutes, and ships exactly the package versions you
-tested against. [src/collect_deps.py](src/collect_deps.py) resolves the dependency
-closure of `requirements.txt` from the venv's installed metadata, so dev-only extras
-that also live in the venv (torch, transformers, …) are left out of the shipped folder.
-
-The one thing that can't come from the working tree is the standalone Python runtime —
-a venv has no interpreter to ship. The embeddable distribution is downloaded once and
-cached in `vendor\`, after which every build (and `-Offline`) works with no network.
-The shipped interpreter must match the venv's Python X.Y, since the copied wheels are
-built against that ABI; the script defaults to the venv's exact version.
-
-The build finishes by importing the whole stack with the bundled interpreter, so a
-missing dependency fails the build rather than the first run on the server.
-
 ## Portable Linux deployment
 
 [build_portable.sh](build_portable.sh) is the Linux counterpart of
@@ -218,7 +211,8 @@ the Windows build:
 run.sh              start the server
 switch_model.sh      change the checkpoint
 enable_gpu.sh        add GPU support
-config.ini           host/port/device
+make_cert.sh         create an HTTPS certificate (needed for the browser mic)
+config.ini           host/port/device/HTTPS
 model_id.txt         which checkpoint is installed
 src/                 the Python modules
 python/ bin/ cuda/ models-ct2/ static/
@@ -229,8 +223,6 @@ Windows script (see [Adding GPU support](#adding-gpu-support-after-a-build) and
 [Changing the model](#changing-the-model-after-a-build) above -- the same trade-offs
 apply here; the default checkpoint is likewise `vinai/PhoWhisper-medium`).
 
-There's no Linux equivalent of `build_local.ps1` yet; contributions welcome.
-
 ## API
 
 - `POST /transcribe` — multipart file upload (`file`), returns `{"text": "..."}`
@@ -239,7 +231,9 @@ There's no Linux equivalent of `build_local.ps1` yet; contributions welcome.
   previous one) about once a second. Close the socket when done. The preview is
   produced from short windows of audio, so it's less accurate. Use it for instant
   feedback while the user speaks, then POST the full recording to `/transcribe` and
-  replace the preview with that result.
+  replace the preview with that result. See
+  [docs/live-preview.md](docs/live-preview.md) for the full client guide with browser
+  and Python examples.
 - `GET /health` — returns `{"status": "ok", "device": "cuda" | "cpu", "model": "..."}`
 
 Example:
@@ -254,6 +248,9 @@ click or after ~2s of silence, and posts the whole recording to `/transcribe`. W
 "Live preview" checked, it also streams to `/ws/stream` while you speak, showing a grey
 preview that the final `/transcribe` result replaces.
 
+Recording from another machine needs the server on HTTPS (see
+[above](#run-the-server)); the page shows a "mic error" otherwise.
+
 `/transcribe` decodes the audio with ffmpeg, so any container
 or codec ffmpeg understands works (WAV, MP3, Opus, the browser's WebM, …).
 
@@ -265,5 +262,6 @@ or codec ffmpeg understands works (WAV, MP3, Opus, the browser's WebM, …).
 | `MODEL_REPO` | `vinai/PhoWhisper-medium` | Checkpoint `src/download_model.py` fetches; a size shortcut (`tiny`/`base`/`small`/`medium`/`large`) or any HF repo id. Overrides `model_id.txt` |
 | `DEVICE` | `auto` | `cuda`, `cpu`, or `auto` to use GPU when available |
 | `COMPUTE_TYPE` | `int8` on CPU, `float16` on GPU | CTranslate2 compute type, e.g. `int8`, `int8_float16`, `float16`, `float32` |
+| `SSL_CERTFILE` / `SSL_KEYFILE` | blank (plain http) | Cert/key for HTTPS, used by `python src/main.py` and the portable `run.bat`/`run.sh` (plain `uvicorn` takes `--ssl-certfile`/`--ssl-keyfile` instead) |
 | `STREAM_UPDATE_SECONDS` | `1.0` | `/ws/stream`: minimum amount of new audio before the preview is re-run |
 | `STREAM_WINDOW_SECONDS` | `8.0` | `/ws/stream`: the in-progress window is committed and a new one starts once it reaches this length |
